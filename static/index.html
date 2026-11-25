@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Region Guard · 地区与防风控全景监测台</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="container">
+    <!-- Top Header -->
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-icon">RG</div>
+        <div>
+          <h1>Region Guard · 地区与防风控全景监测台</h1>
+          <p class="subtitle">本机直采 10+ GeoIP / WHOIS / 全域名分流 / UDP STUN / macOS 系统指纹 / 浏览器 WebRTC 实测（纯只读 · 零密码/Cookie 明文）</p>
+        </div>
+      </div>
+      <div class="controls">
+        <label class="select-wrap" for="targetSelect">
+          <span>目标地区</span>
+          <select id="targetSelect">
+            <option value="SG" selected>新加坡 (SG)</option>
+            <option value="US">美国 (US)</option>
+            <option value="JP">日本 (JP)</option>
+            <option value="GB">英国 (GB)</option>
+            <option value="TW">台湾 (TW)</option>
+            <option value="AU">澳大利亚 (AU)</option>
+            <option value="CA">加拿大 (CA)</option>
+            <option value="DE">德国 (DE)</option>
+          </select>
+        </label>
+        <button id="scanBtn" class="btn btn-primary">立即全面扫描</button>
+        <button id="exportBtn" class="btn btn-secondary" disabled>导出脱敏 JSON</button>
+      </div>
+    </header>
+
+    <!-- Alert Banner (hidden by default) -->
+    <div id="alertBanner" class="alert-banner hidden"></div>
+
+    <!-- Top Summary Cards -->
+    <section class="summary-grid">
+      <div class="card score-card">
+        <div class="score-ring-wrap">
+          <svg class="score-ring" viewBox="0 0 120 120">
+            <circle class="ring-bg" cx="60" cy="60" r="52"></circle>
+            <circle id="scoreRingFill" class="ring-fill" cx="60" cy="60" r="52" stroke-dasharray="326.7" stroke-dashoffset="326.7"></circle>
+          </svg>
+          <div class="score-number">
+            <span id="scoreValue">--</span>
+            <small>分</small>
+          </div>
+        </div>
+        <div class="score-meta">
+          <div id="verdictTitle" class="verdict-title">等待扫描...</div>
+          <div id="verdictDesc" class="verdict-desc">包含后端系统/网络 + 浏览器实时检测综合评分</div>
+        </div>
+      </div>
+
+      <div class="card stat-card">
+        <div class="card-label">检测项分布与红线</div>
+        <div class="stat-pills">
+          <div class="pill pass"><span id="cntPass">0</span><small>通过 PASS</small></div>
+          <div class="pill warn"><span id="cntWarn">0</span><small>警告 WARN</small></div>
+          <div class="pill fail"><span id="cntFail">0</span><small>高危 FAIL</small></div>
+          <div class="pill info"><span id="cntInfo">0</span><small>提示 INFO</small></div>
+        </div>
+        <div id="redlinePill" class="redline-banner pass">致命红线: 0 项</div>
+      </div>
+
+      <div class="card egress-card">
+        <div class="card-label">当前 Claude 出口画像</div>
+        <div class="egress-main">
+          <span id="egressIp" class="mono big-ip">--</span>
+          <span id="egressBadge" class="badge info">--</span>
+        </div>
+        <div id="egressMeta" class="egress-meta">等待获取 ASN / 时区 / rDNS / WHOIS 信息</div>
+      </div>
+
+      <div class="card time-card">
+        <div class="card-label">最近扫描状态</div>
+        <div id="scanTimestamp" class="time-main">--</div>
+        <div id="scanDuration" class="egress-meta">耗时: --</div>
+      </div>
+    </section>
+
+    <!-- Live Continuous Pulse Monitor -->
+    <section class="card monitor-card">
+      <div class="section-head">
+        <div>
+          <div class="monitor-head-title">
+            <h2>后台防断流守护监控 (Pulse Daemon)</h2>
+            <span id="monitorStateBadge" class="badge err">未开启</span>
+          </div>
+          <p class="section-sub">由后端 Python 独立线程持续运行并写入本地日志，关闭网页也会继续探活，可抓休眠唤醒瞬断与 IP 跳变</p>
+        </div>
+        <div class="monitor-actions">
+          <select id="pulseInterval">
+            <option value="15">每 15 秒</option>
+            <option value="30" selected>每 30 秒</option>
+            <option value="60">每 60 秒</option>
+          </select>
+          <button id="monitorToggleBtn" class="btn btn-accent">开启后台持续监控</button>
+          <button id="clearHistoryBtn" class="btn btn-ghost">清空记录</button>
+        </div>
+      </div>
+
+      <div class="pulse-kpis">
+        <div class="kpi"><span>监控次数</span><strong id="kpiTotal">0</strong></div>
+        <div class="kpi"><span>异常次数</span><strong id="kpiAnomaly" class="text-danger">0</strong></div>
+        <div class="kpi"><span>IP 跳变次数</span><strong id="kpiJump" class="text-warn">0</strong></div>
+        <div class="kpi"><span>休眠唤醒捕获</span><strong id="kpiWake" class="text-warn">0</strong></div>
+        <div class="kpi"><span>当前延迟</span><strong id="kpiLatency">--</strong></div>
+        <div class="kpi"><span>最新出口 / 机房</span><strong id="kpiLatest" class="mono">--</strong></div>
+      </div>
+
+      <div class="table-scroll monitor-scroll">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>时间</th>
+              <th>状态</th>
+              <th>出口 IP</th>
+              <th>Cloudflare 地区 / 机房</th>
+              <th>TUN 隧道</th>
+              <th>延迟</th>
+              <th>异常说明</th>
+            </tr>
+          </thead>
+          <tbody id="pulseBody">
+            <tr><td colspan="7" class="empty-cell">暂无监控记录，点击「开始持续监控」或先做一次扫描</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Two-Column Matrix: Multi-DB GeoIP & Multi-Domain Routing -->
+    <section class="matrix-grid">
+      <div class="card">
+        <div class="section-head compact">
+          <div>
+            <h2>10 大 GeoIP 数据库交叉验证</h2>
+            <p class="section-sub">识别跨国广播段或不同风控库对同一 IP 的归属冲突</p>
+          </div>
+        </div>
+        <div id="whoisSummaryBar" class="whois-bar">等待 WHOIS / BGP / rDNS 核验...</div>
+        <div class="table-scroll">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>数据源</th>
+                <th>国家</th>
+                <th>城市 / 地区</th>
+                <th>时区</th>
+                <th>ASN / 机构</th>
+                <th>代理标记</th>
+                <th>判定</th>
+              </tr>
+            </thead>
+            <tbody id="geoipBody">
+              <tr><td colspan="7" class="empty-cell">等待扫描...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="section-head compact">
+          <div>
+            <h2>全域名分流与第三方风控接口检测</h2>
+            <p class="section-sub">核查 Anthropic 全系域名、Cloudflare 验证域、Stripe / hCaptcha / Datadog / Sentry / OAuth 与国内探测点</p>
+          </div>
+        </div>
+        <div class="table-scroll">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>域名 / 接口</th>
+                <th>出口 IP / HTTP 状态</th>
+                <th>国家 / 归属</th>
+                <th>机房 / 类别</th>
+                <th>延迟</th>
+                <th>状态</th>
+              </tr>
+            </thead>
+            <tbody id="domainBody">
+              <tr><td colspan="6" class="empty-cell">等待扫描...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- Claude Local Generated Files & Device-Linking Residue Inventory -->
+    <section class="card inventory-card">
+      <div class="section-head compact">
+        <div>
+          <h2>Claude 本机生成文件与设备关联残留全景清单</h2>
+          <p class="section-sub">覆盖 Desktop 指纹文件（ant-did / Cookies / device_id_salt / config / 日志）、Claude Code CLI、全库钥匙串、~/Library 12 子目录、崩溃/临时/IDE 与 Safari WebsiteData / ITP / 历史（纯只读脱敏）</p>
+        </div>
+        <span id="inventoryBadge" class="badge info">等待扫描...</span>
+      </div>
+      <div class="table-scroll">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>归属模块</th>
+              <th>检测项目</th>
+              <th>本机路径 / 存储位</th>
+              <th>风控关联作用</th>
+              <th>实测状态</th>
+              <th>判定</th>
+            </tr>
+          </thead>
+          <tbody id="inventoryBody">
+            <tr><td colspan="6" class="empty-cell">等待扫描...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Detailed Audit Categories -->
+    <section class="audit-section">
+      <div class="audit-header">
+        <h2>全维度体检明细（系统 · 网络 · 代理 · 指纹 · 浏览器）</h2>
+        <div class="filter-tabs" role="tablist">
+          <button class="tab-btn active" data-filter="all">全部</button>
+          <button class="tab-btn" data-filter="issues">仅看异常 (FAIL+WARN)</button>
+          <button class="tab-btn" data-filter="fail">仅看高危 (FAIL)</button>
+        </div>
+      </div>
+      <div id="categoriesContainer" class="categories-grid">
+        <div class="card empty-card">正在初始化并准备扫描...</div>
+      </div>
+    </section>
+
+    <!-- Manual Server-Side & Account Checklist -->
+    <section class="card checklist-card">
+      <div class="section-head compact">
+        <div>
+          <h2>服务端与账号层人工自检清单（本机工具无法自动读取）</h2>
+          <p class="section-sub">以下 6 项属于 Anthropic / Stripe / OAuth 服务端或浏览器隔离信号，请逐项人工核对并勾选记录</p>
+        </div>
+        <span id="checklistProgress" class="badge info">0 / 6 已确认</span>
+      </div>
+      <div id="manualChecklist" class="checklist-list">
+        <label class="checklist-item"><input type="checkbox" data-check="fresh_account" /><span>使用未曾被 <code class="mono">account_banned</code> 或 <code class="mono">region_blocked</code> 标记过的全新账号</span></label>
+        <label class="checklist-item"><input type="checkbox" data-check="safari_profile" /><span>已清理 Safari Manage Website Data（claude / anthropic / hcaptcha / stripe），或已为新号新建独立的 Safari Profile（全新 Cookies / WebsiteData / DeviceIdHashSalts）</span></label>
+        <label class="checklist-item"><input type="checkbox" data-check="oauth_region" /><span>登录用的 Google / Apple OAuth 账号历史地区在支持区内（非刚改区或国内主力号）</span></label>
+        <label class="checklist-item"><input type="checkbox" data-check="card_bin" /><span>支付卡发卡行国家（BIN）与账单地址在支持区，且与节点所属国家一致</span></label>
+        <label class="checklist-item"><input type="checkbox" data-check="phone_sms" /><span>手机号验证区号为支持地区，且非高风控虚拟号段（VoIP / 公开接码平台）</span></label>
+        <label class="checklist-item"><input type="checkbox" data-check="reboot_abc" /><span>系统级修改（Country / 主机名 / 时区 / Power Nap / 定位）完成后已完整重启 Mac，并切到 ABC 英文键盘再登录</span></label>
+      </div>
+    </section>
+  </div>
+
+  <div id="toast" class="toast hidden">已复制到剪贴板</div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
