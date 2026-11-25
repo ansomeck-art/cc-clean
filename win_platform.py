@@ -2109,7 +2109,8 @@ def win_audit_claude_browser_residue() -> Dict[str, Any]:
             relay_hits.append(f"工具目录:{h_lbl}")
     env_bu = os.environ.get("ANTHROPIC_BASE_URL", "").strip()
     if env_bu and "api.anthropic.com" not in env_bu.lower():
-        relay_hits.append(f"env:ANTHROPIC_BASE_URL={re.sub(r'://[^/@\\s]+@', '://<REDACTED>@', env_bu)}")
+        safe_env_bu = re.sub(r"://[^/@\s]+@", "://<REDACTED>@", env_bu)
+        relay_hits.append(f"env:ANTHROPIC_BASE_URL={safe_env_bu}")
     if relay_hits:
         checks.append(
             _make_check(

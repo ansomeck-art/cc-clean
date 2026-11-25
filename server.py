@@ -2772,7 +2772,8 @@ def audit_claude_safari_residue() -> Dict[str, Any]:
             mac_relay_hits.append(f"工具目录:{h_lbl}")
     env_bu = os.environ.get("ANTHROPIC_BASE_URL", "").strip()
     if env_bu and "api.anthropic.com" not in env_bu.lower():
-        mac_relay_hits.append(f"env:ANTHROPIC_BASE_URL={re.sub(r'://[^/@\\s]+@', '://<REDACTED>@', env_bu)}")
+        safe_env_bu = re.sub(r"://[^/@\s]+@", "://<REDACTED>@", env_bu)
+        mac_relay_hits.append(f"env:ANTHROPIC_BASE_URL={safe_env_bu}")
     if mac_relay_hits:
         checks.append(
             make_check(
