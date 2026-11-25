@@ -1495,6 +1495,106 @@ def win_audit_system(target_cfg: Dict[str, Any]) -> Dict[str, Any]:
         )
     )
 
+    # 17. VM / Hypervisor BIOS Fingerprint & Security/Remote-Control Software TLS Risk
+    bios_mfg = str(_read_reg("HKEY_LOCAL_MACHINE", r"HARDWARE\DESCRIPTION\System\BIOS", "SystemManufacturer", "") or "").strip()
+    bios_prod = str(_read_reg("HKEY_LOCAL_MACHINE", r"HARDWARE\DESCRIPTION\System\BIOS", "SystemProductName", "") or "").strip()
+    bios_vendor = str(_read_reg("HKEY_LOCAL_MACHINE", r"HARDWARE\DESCRIPTION\System\BIOS", "BIOSVendor", "") or "").strip()
+    bios_combo = f"{bios_mfg} {bios_prod} {bios_vendor}".lower()
+    vm_kw = ("vmware", "virtualbox", "qemu", "kvm", "xen", "parallels", "bochs", "virtual machine", "innotek")
+    is_vm = any(k in bios_combo for k in vm_kw)
+
+    _, tl_sec_out, _ = _run_win_cmd(["tasklist", "/FO", "CSV", "/NH"], timeout=4)
+    sec_procs = _parse_tasklist_csv(tl_sec_out)
+    tls_av_hits = [p for p in sec_procs if re.search(r"360tray|360safe|zhudongfangyu|hipstray|huorong|avp\.exe|ekrn\.exe|sangfor|easyconnect", p, re.I)]
+    rc_hits = [p for p in sec_procs if re.search(r"sunlogin|todesk|anydesk|teamviewer|oray", p, re.I)]
+
+    vm_obs = f"主板/机型={bios_mfg or '-'} {bios_prod or '-'}" + (f" | 杀软/安全进程={','.join(tls_av_hits[:3])}" if tls_av_hits else "") + (f" | 远控={','.join(rc_hits[:3])}" if rc_hits else "")
+    if is_vm or tls_av_hits:
+        checks.append(
+            _make_check(
+                "vm_security_env",
+                "虚拟机硬件特征与杀软 TLS 解密 / 远控软件环境",
+                "WARN",
+                vm_obs,
+                ("检测到常见虚拟机 BIOS/硬件标识，原生客户端与 WebGL 可能暴露虚拟化环境。" if is_vm else "")
+                + ("检测到安全软件/VPN 进程（360/火绒/卡巴斯基/ESET/深信服等），若开启了「HTTPS/SSL 加密流量扫描」会替换 TLS 证书链并破坏浏览器 JA4 指纹！" if tls_av_hits else ""),
+                "如使用杀软请关闭 HTTPS/SSL 流量解密扫描；如在虚拟机中登录 Claude，需注意虚拟显卡与 BIOS 特征。",
+                severity="high" if tls_av_hits else "low",
+            )
+        )
+    else:
+        checks.append(_make_check("vm_security_env", "虚拟机硬件特征与杀软 TLS 解密 / 远控软件环境", "PASS", vm_obs, "物理机硬件特征正常，未发现高风险 HTTPS 拦截型杀软常驻进程。"))
+
+    # 18. Global Git Identity Check for Claude Code CLI (privacy-safe: NEVER prints email!)
+    gitconfig_path = os.path.join(os.environ.get("USERPROFILE", os.path.expanduser("~")), ".gitconfig")
+    git_cn_domain = ""
+    git_cjk_name = False
+    if os.path.isfile(gitconfig_path):
+        try:
+            with open(gitconfig_path, "r", encoding="utf-8", errors="replace") as f:
+                gc_txt = f.read()
+            m_em = re.search(r"^\s*email\s*=\s*(.+)$", gc_txt, re.M | re.I)
+            if m_em:
+                em_val = m_em.group(1).strip().strip('"').strip("'").lower()
+                if "@" in em_val:
+                    dom = em_val.split("@", 1)[1]
+                    if dom in {"qq.com", "foxmail.com", "163.com", "126.com", "sina.com", "sina.cn", "sohu.com", "aliyun.com", "yeah.net", "139.com", "189.cn"}:
+                        git_cn_domain = dom
+            m_nm = re.search(r"^\s*name\s*=\s*(.+)$", gc_txt, re.M | re.I)
+            if m_nm and _has_cjk(m_nm.group(1)):
+                git_cjk_name = True
+        except Exception:
+            pass
+    if git_cn_domain or git_cjk_name:
+        g_parts = []
+        if git_cn_domain:
+            g_parts.append(f"邮箱后缀为国内域名(@{git_cn_domain}，已脱敏)")
+        if git_cjk_name:
+            g_parts.append("user.name 含中文字符")
+        checks.append(
+            _make_check(
+                "git_identity_leak",
+                "Git 全局身份配置 (Claude Code CLI 上下文)",
+                "WARN",
+                "；".join(g_parts),
+                "使用 Claude Code CLI 在 Git 仓库工作时，CLI 会读取 git config 并在提交/会话元数据中带上作者身份，请避免与旧封号邮箱或明显中文标识混用。",
+                "如使用 Claude Code，建议在仓库或全局改用与新号匹配的纯英文 Git 身份（git config --global user.name/user.email）。",
+            )
+        )
+    else:
+        checks.append(_make_check("git_identity_leak", "Git 全局身份配置 (Claude Code CLI 上下文)", "PASS", "未发现国内邮箱后缀或中文 Git 用户名", "全局 ~/.gitconfig 无明显国内邮箱域名或中文用户名特征。"))
+
+    # 19. Windows DNS Client Cache Stale Record Audit (ipconfig /displaydns)
+    rc_dc, dc_out, _ = _run_win_cmd(["ipconfig", "/displaydns"], timeout=5)
+    stale_real_dns: List[str] = []
+    if rc_dc == 0 and dc_out:
+        cur_rec = ""
+        for line in dc_out.splitlines():
+            s = line.strip()
+            low = s.lower()
+            if any(k in low for k in ("record name", "记录名称")) and ":" in s:
+                cur_rec = s.split(":", 1)[1].strip().lower()
+            elif cur_rec and _match_risk_domain(cur_rec) and any(k in low for k in ("a (host) record", "a (主机) 记录")) and ":" in s:
+                ip_c = s.split(":", 1)[1].strip()
+                if ip_c and not ip_c.startswith(("198.18.", "198.19.")):
+                    tag = f"{cur_rec}->{ip_c}"
+                    if tag not in stale_real_dns:
+                        stale_real_dns.append(tag)
+    if stale_real_dns:
+        checks.append(
+            _make_check(
+                "win_dns_cache",
+                "Windows 系统 DNS 缓存陈旧记录检测 (displaydns)",
+                "WARN",
+                f"缓存中存在 {len(stale_real_dns)} 条非 Fake-IP 记录: {', '.join(stale_real_dns[:4])}",
+                "若在开启代理 TUN 前访问过相关域名，Windows DNS Client 会缓存旧的真实/污染 IP，切换代理后短时间内仍可能直连旧地址。",
+                "切换节点或刚开启 TUN 后建议执行一次刷新系统 DNS 缓存。",
+                "ipconfig /flushdns",
+            )
+        )
+    else:
+        checks.append(_make_check("win_dns_cache", "Windows 系统 DNS 缓存陈旧记录检测 (displaydns)", "PASS", "未检出陈旧的非 Fake-IP 风控域名缓存", "系统 DNS 缓存中无残留的 Claude/Anthropic/Stripe/hCaptcha 非 Fake-IP 旧记录。"))
+
     return {"title": "Windows 系统环境与指纹", "checks": checks}
 
 
@@ -1668,6 +1768,8 @@ def win_audit_claude_browser_residue() -> Dict[str, Any]:
             os.path.join(localappdata, "AnthropicClaude") if localappdata else "",
             os.path.join(localappdata, "claude-desktop-updater") if localappdata else "",
             os.path.join(localappdata, "Claude") if localappdata else "",
+            os.path.join(localappdata, "Claude-3p") if localappdata else "",
+            os.path.join(localappdata, "Claude-Data") if localappdata else "",
         ] + msix_pkg_dirs
         if p and os.path.exists(p)
     ]
@@ -1970,6 +2072,7 @@ def win_audit_claude_browser_residue() -> Dict[str, Any]:
         except Exception:
             pass
         # Check settings.json / settings.local.json for hidden relay/proxy env (never reads keys/tokens)
+        relay_hits: List[str] = []
         for sf in ("settings.json", "settings.local.json"):
             sfp = os.path.join(cc_dir, sf)
             if os.path.isfile(sfp):
@@ -1981,14 +2084,55 @@ def win_audit_claude_browser_residue() -> Dict[str, Any]:
                         if s_env.get(ek):
                             clean_ev = re.sub(r"://[^/@\s]+@", "://<REDACTED>@", str(s_env[ek]))
                             cc_notes.append(f"{sf}:{ek}={clean_ev}")
+                            if ek == "ANTHROPIC_BASE_URL" and "api.anthropic.com" not in clean_ev.lower():
+                                relay_hits.append(f"{sf}:ANTHROPIC_BASE_URL={clean_ev}")
                     if sd.get("apiKeyHelper"):
                         cc_notes.append(f"{sf} 含 apiKeyHelper")
+                        relay_hits.append(f"{sf}:apiKeyHelper")
                 except Exception:
                     pass
         cc_notes.append(f"{os.path.basename(cc_dir)}\\ ({fcnt} 文件, {_fmt_bytes(fbytes)}; {', '.join(sub_cc[:6]) if sub_cc else '子项'})")
+    else:
+        relay_hits = []
     if xdg_hits:
         cc_status = "WARN" if cc_status == "PASS" else cc_status
         cc_notes.append(f"缓存/额外目录 {len(xdg_hits)} 个 ({', '.join(os.path.basename(p) for p in xdg_hits[:3])})")
+
+    # Also check known third-party Claude harness / router / switcher tools & process/reg ANTHROPIC_BASE_URL
+    for h_lbl, h_path in [
+        ("claude-code-router", os.path.join(userprofile, ".claude-code-router")),
+        ("cc-switch", os.path.join(userprofile, ".cc-switch")),
+        ("cc-switch(.config)", os.path.join(userprofile, ".config", "cc-switch")),
+        ("claude-relay", os.path.join(userprofile, ".claude-relay")),
+    ]:
+        if os.path.exists(h_path):
+            relay_hits.append(f"工具目录:{h_lbl}")
+    env_bu = os.environ.get("ANTHROPIC_BASE_URL", "").strip()
+    if env_bu and "api.anthropic.com" not in env_bu.lower():
+        relay_hits.append(f"env:ANTHROPIC_BASE_URL={re.sub(r'://[^/@\\s]+@', '://<REDACTED>@', env_bu)}")
+    if relay_hits:
+        checks.append(
+            _make_check(
+                "claude_relay_harness",
+                "第三方中转站 / 本地转发桥 / 套壳 Harness 检测 (高危封号红线)",
+                "FAIL",
+                f"命中 {len(relay_hits)} 项: {', '.join(relay_hits[:4])}",
+                "检测到非官方的 ANTHROPIC_BASE_URL、本地转发服务（如 127.0.0.1 端口桥接）或第三方切换/中转工具！Anthropic 明确严查在第三方中转/套壳工具中复用 Pro/Max OAuth 订阅凭据，极易直接触发 account_banned！",
+                "使用官方订阅新号时，务必移除 settings.json 与环境变量中的自定义 ANTHROPIC_BASE_URL / apiKeyHelper，只直连官方 api.anthropic.com。",
+                severity="critical",
+            )
+        )
+        add_inv("Claude Code CLI", "中转站 / 本地转发配置", r"~/.claude/settings*.json · ~/.cc-switch · ~/.claude-code-router", "检测非官方 ANTHROPIC_BASE_URL 与 OAuth 套壳转发（高频封号诱因）", ", ".join(relay_hits[:4]), "FAIL")
+    else:
+        checks.append(
+            _make_check(
+                "claude_relay_harness",
+                "第三方中转站 / 本地转发桥 / 套壳 Harness 检测 (高危封号红线)",
+                "PASS",
+                "未发现自定义 ANTHROPIC_BASE_URL 或第三方转发工具",
+                "Claude Code 配置未指向第三方中转站或本地转发代理桥。",
+            )
+        )
 
     cli_clean_cmd = (
         'Remove-Item -Recurse -Force "$env:USERPROFILE\\.claude.json","$env:USERPROFILE\\.claude.json.backup*",'
@@ -2203,6 +2347,26 @@ def win_audit_claude_browser_residue() -> Dict[str, Any]:
                 elif qst == "locked":
                     b_locked = True
                 break
+
+            # Read-only Chromium hidden DIPS (Bounce Tracking) DB & History domain-only scan
+            dips_file = os.path.join(pdir, "DIPS")
+            if os.path.isfile(dips_file):
+                qst_d, rows_d = _safe_sqlite_query(dips_file, "SELECT DISTINCT site FROM bounces")
+                if qst_d == "ok":
+                    for (site,) in rows_d:
+                        s_clean = str(site).strip().lstrip(".")
+                        if _match_risk_domain(s_clean):
+                            b_claude_hosts.add(s_clean)
+                            b_storage_sources.add("DIPS")
+            hist_file = os.path.join(pdir, "History")
+            if os.path.isfile(hist_file):
+                qst_h, rows_h = _safe_sqlite_query(hist_file, "SELECT url FROM urls")
+                if qst_h == "ok":
+                    for (u,) in rows_h:
+                        m_u = re.match(r"https?://([^/:]+)", str(u or "").lower())
+                        if m_u and _match_risk_domain(m_u.group(1)):
+                            b_claude_hosts.add(m_u.group(1))
+                            b_storage_sources.add("History")
 
         if b_proxy_exts:
             b_tags.append(f"代理扩展={','.join(b_proxy_exts[:2])}")

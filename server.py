@@ -408,13 +408,14 @@ def _check_utun_status() -> Tuple[bool, List[str], List[str], List[str]]:
 # ---------------------------------------------------------------------------
 # Category 1: Egress IP, Multi-DB GeoIP & WHOIS/BGP Reputation
 # ---------------------------------------------------------------------------
-def _query_geoip_ipinfo() -> Dict[str, Any]:
-    ok, data, ms, err = curl_json("https://ipinfo.io/json", timeout=6)
+def _query_geoip_ipinfo(ip: str = "") -> Dict[str, Any]:
+    url = f"https://ipinfo.io/{urllib.parse.quote(ip)}/json" if ip else "https://ipinfo.io/json"
+    ok, data, ms, err = curl_json(url, timeout=6)
     if not ok or not isinstance(data, dict):
         return {"source": "IPinfo", "status": "ERR", "error": err, "latency_ms": ms}
     return {
         "source": "IPinfo",
-        "ip": data.get("ip", ""),
+        "ip": data.get("ip", ip),
         "country": data.get("country", ""),
         "city": data.get("city", ""),
         "region": data.get("region", ""),
@@ -426,9 +427,10 @@ def _query_geoip_ipinfo() -> Dict[str, Any]:
     }
 
 
-def _query_geoip_ipapi() -> Dict[str, Any]:
+def _query_geoip_ipapi(ip: str = "") -> Dict[str, Any]:
+    target_seg = urllib.parse.quote(ip) if ip else ""
     url = (
-        "http://ip-api.com/json/?fields=status,country,countryCode,"
+        f"http://ip-api.com/json/{target_seg}?fields=status,country,countryCode,"
         "regionName,city,timezone,isp,org,as,hosting,proxy,mobile,query"
     )
     ok, data, ms, err = curl_json(url, timeout=6)
@@ -436,7 +438,7 @@ def _query_geoip_ipapi() -> Dict[str, Any]:
         return {"source": "ip-api.com", "status": "ERR", "error": err or "failed", "latency_ms": ms}
     return {
         "source": "ip-api.com",
-        "ip": data.get("query", ""),
+        "ip": data.get("query", ip),
         "country": data.get("countryCode", ""),
         "city": data.get("city", ""),
         "region": data.get("regionName", ""),
@@ -2144,6 +2146,40 @@ def audit_macos_system(target_cfg: Dict[str, Any]) -> Dict[str, Any]:
             )
         )
 
+    # 20. Global Git Identity Check for Claude Code CLI (privacy-safe: NEVER prints email)
+    gc_path = os.path.expanduser("~/.gitconfig")
+    git_cn_dom = ""
+    git_cjk = False
+    if os.path.isfile(gc_path):
+        try:
+            gc_txt = open(gc_path, "r", encoding="utf-8", errors="replace").read()
+            m_em = re.search(r"^\s*email\s*=\s*(.+)$", gc_txt, re.M | re.I)
+            if m_em:
+                em_v = m_em.group(1).strip().strip('"').strip("'").lower()
+                if "@" in em_v:
+                    d_em = em_v.split("@", 1)[1]
+                    if d_em in {"qq.com", "foxmail.com", "163.com", "126.com", "sina.com", "sina.cn", "sohu.com", "aliyun.com", "yeah.net", "139.com", "189.cn"}:
+                        git_cn_dom = d_em
+            m_nm = re.search(r"^\s*name\s*=\s*(.+)$", gc_txt, re.M | re.I)
+            if m_nm and has_cjk(m_nm.group(1)):
+                git_cjk = True
+        except Exception:
+            pass
+    if git_cn_dom or git_cjk:
+        gp = ([f"邮箱为国内域名(@{git_cn_dom}，已脱敏)"] if git_cn_dom else []) + (["user.name 含中文"] if git_cjk else [])
+        checks.append(
+            make_check(
+                "git_identity_leak",
+                "Git 全局身份配置 (Claude Code CLI 上下文)",
+                "WARN",
+                "；".join(gp),
+                "Claude Code CLI 会读取 git config 作为提交/会话上下文，请避免与旧封号邮箱或中文标识混用。",
+                "建议使用与新号一致的纯英文 Git 身份（git config --global user.name/user.email）。",
+            )
+        )
+    else:
+        checks.append(make_check("git_identity_leak", "Git 全局身份配置 (Claude Code CLI 上下文)", "PASS", "未发现国内邮箱后缀或中文 Git 用户名", "全局 ~/.gitconfig 无明显国内邮箱域名或中文用户名特征。"))
+
     return {"title": "macOS 系统环境与指纹", "checks": checks}
 
 
@@ -2700,6 +2736,7 @@ def audit_claude_safari_residue() -> Dict[str, Any]:
                 cc_status = "FAIL"
         except Exception:
             pass
+        mac_relay_hits: List[str] = []
         for sf in ("settings.json", "settings.local.json"):
             sfp = os.path.join(cc_dir, sf)
             if os.path.isfile(sfp):
@@ -2710,13 +2747,55 @@ def audit_claude_safari_residue() -> Dict[str, Any]:
                         if s_env.get(ek):
                             clean_ev = re.sub(r"://[^/@\s]+@", "://<REDACTED>@", str(s_env[ek]))
                             cc_notes.append(f"{sf}:{ek}={clean_ev}")
+                            if ek == "ANTHROPIC_BASE_URL" and "api.anthropic.com" not in clean_ev.lower():
+                                mac_relay_hits.append(f"{sf}:ANTHROPIC_BASE_URL={clean_ev}")
+                    if sd.get("apiKeyHelper"):
+                        cc_notes.append(f"{sf} 含 apiKeyHelper")
+                        mac_relay_hits.append(f"{sf}:apiKeyHelper")
                 except Exception:
                     pass
         fcnt, fbytes = _dir_stats(cc_dir, max_files=1000)
         cc_notes.append(f"~/.claude/ ({fcnt} 文件, {_fmt_bytes(fbytes)}; 含 {', '.join(sub_cc[:6]) if sub_cc else '子项'})")
+    else:
+        mac_relay_hits = []
     if existing_xdg:
         cc_status = "WARN" if cc_status == "PASS" else cc_status
         cc_notes.append(f"XDG/隐藏目录 {len(existing_xdg)} 个: {', '.join(os.path.basename(p) for p in existing_xdg)}")
+
+    for h_lbl, h_path in [
+        ("claude-code-router", os.path.expanduser("~/.claude-code-router")),
+        ("cc-switch", os.path.expanduser("~/.cc-switch")),
+        ("cc-switch(.config)", os.path.expanduser("~/.config/cc-switch")),
+        ("claude-relay", os.path.expanduser("~/.claude-relay")),
+    ]:
+        if os.path.exists(h_path):
+            mac_relay_hits.append(f"工具目录:{h_lbl}")
+    env_bu = os.environ.get("ANTHROPIC_BASE_URL", "").strip()
+    if env_bu and "api.anthropic.com" not in env_bu.lower():
+        mac_relay_hits.append(f"env:ANTHROPIC_BASE_URL={re.sub(r'://[^/@\\s]+@', '://<REDACTED>@', env_bu)}")
+    if mac_relay_hits:
+        checks.append(
+            make_check(
+                "claude_relay_harness",
+                "第三方中转站 / 本地转发桥 / 套壳 Harness 检测 (高危封号红线)",
+                "FAIL",
+                f"命中 {len(mac_relay_hits)} 项: {', '.join(mac_relay_hits[:4])}",
+                "检测到非官方的 ANTHROPIC_BASE_URL、本地转发桥或第三方切换/中转工具！Anthropic 明确严查在第三方套壳/中转工具中复用 Pro/Max OAuth 订阅凭据，极易直接触发 account_banned！",
+                "使用官方订阅新号时，务必移除 settings.json 与环境变量中的自定义 ANTHROPIC_BASE_URL / apiKeyHelper。",
+                severity="critical",
+            )
+        )
+        add_inv("Claude Code CLI", "中转站 / 本地转发配置", "~/.claude/settings*.json · ~/.cc-switch · ~/.claude-code-router", "检测非官方 ANTHROPIC_BASE_URL 与 OAuth 套壳转发（高频封号诱因）", ", ".join(mac_relay_hits[:4]), "FAIL")
+    else:
+        checks.append(
+            make_check(
+                "claude_relay_harness",
+                "第三方中转站 / 本地转发桥 / 套壳 Harness 检测 (高危封号红线)",
+                "PASS",
+                "未发现自定义 ANTHROPIC_BASE_URL 或第三方转发工具",
+                "Claude Code 配置未指向第三方中转站或本地转发代理桥。",
+            )
+        )
 
     cli_clean_cmd = "rm -rf ~/.claude.json ~/.claude.json.backup* ~/.claude ~/.anthropic ~/.config/claude* ~/.cache/claude* ~/.local/share/claude* ~/.local/state/claude*"
     if cc_status == "PASS":
@@ -3333,21 +3412,27 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
         f_cn2 = pool.submit(_check_cn_ip_url, "ip.3322.net", "http://ip.3322.net")
 
         primary_trace = f_primary.result()
-        ipinfo_res = f_ipinfo.result()
-        ipapi_res = f_ipapi.result()
+        ipinfo_self = f_ipinfo.result()
+        ipapi_self = f_ipapi.result()
         ifconfig_res = f_ifconfig.result()
 
+        claude_ip = primary_trace.get("ip") or ""
         egress_ip = (
-            primary_trace.get("ip")
-            or ipinfo_res.get("ip")
-            or ipapi_res.get("ip")
+            claude_ip
+            or ipinfo_self.get("ip")
+            or ipapi_self.get("ip")
             or ifconfig_res.get("ip")
             or ""
         )
 
         # Phase B: IP-dependent GeoIP/WHOIS/DNSBL/reputation queries in parallel
+        # If default overseas proxy group returned a DIFFERENT IP than claude.ai, also query IPinfo/ip-api for claude.ai's TRUE IP!
         ip_futures: Dict[str, concurrent.futures.Future] = {}
         if egress_ip:
+            if claude_ip and ipinfo_self.get("ip") and ipinfo_self.get("ip") != claude_ip:
+                ip_futures["ipinfo_true"] = pool.submit(_query_geoip_ipinfo, claude_ip)
+            if claude_ip and ipapi_self.get("ip") and ipapi_self.get("ip") != claude_ip:
+                ip_futures["ipapi_true"] = pool.submit(_query_geoip_ipapi, claude_ip)
             ip_futures["ipwhois"] = pool.submit(_query_geoip_ipwhois, egress_ip)
             ip_futures["ip2loc"] = pool.submit(_query_geoip_ip2location, egress_ip)
             ip_futures["ipsb"] = pool.submit(_query_geoip_ipsb, egress_ip)
@@ -3395,6 +3480,8 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
         domain_rows: List[Dict[str, Any]] = [primary_trace] + [f_domains[d].result() for d in cf_domains[1:]]
         cn_rows: List[Dict[str, Any]] = [f_cn1.result(), f_cn2.result()]
 
+        ipinfo_res = ip_futures["ipinfo_true"].result() if "ipinfo_true" in ip_futures else ipinfo_self
+        ipapi_res = ip_futures["ipapi_true"].result() if "ipapi_true" in ip_futures else ipapi_self
         ipwhois_res = ip_futures["ipwhois"].result() if "ipwhois" in ip_futures else {"source": "ipwho.is", "status": "ERR", "error": "no ip"}
         ip2loc_res = ip_futures["ip2loc"].result() if "ip2loc" in ip_futures else {"source": "ip2location.io", "status": "ERR", "error": "no ip"}
         ipsb_res = ip_futures["ipsb"].result() if "ipsb" in ip_futures else {"source": "api.ip.sb", "status": "ERR", "error": "no ip"}
@@ -3792,6 +3879,42 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
                 f"存在分流/失败域名: {', '.join(bad_doms) if bad_doms else f'多出口 IP {cf_ips}'}",
                 "部分 Anthropic 或 Cloudflare 域名未走同一目标节点，会导致服务端与验证服务看到不同 IP/国家。",
                 "确保所有 anthropic.com / claude.ai / claude.com / cloudflare.com / stripe.com / stripe.network / hcaptcha.com / statsig.anthropic.com 走同一节点。",
+            )
+        )
+
+    # Multi-Group Proxy Split-Exit Detection (AI Group IP vs Default Overseas Proxy Group IP!)
+    default_probes = [
+        ("IPinfo", ipinfo_self.get("ip", ""), ipinfo_self.get("country", "")),
+        ("ip-api", ipapi_self.get("ip", ""), ipapi_self.get("country", "")),
+        ("ifconfig.co", ifconfig_res.get("ip", ""), ifconfig_res.get("country", "")),
+        ("ipleak.net", str(ipleak_res.get("ip") or ""), str(ipleak_res.get("country_code") or "")),
+    ]
+    diff_default = [
+        f"{src}={dip}({dcc or '?'})"
+        for src, dip, dcc in default_probes
+        if dip and claude_ip and dip != claude_ip
+    ]
+    if claude_ip and diff_default:
+        leak_checks.append(
+            make_check(
+                "ai_vs_default_proxy_split",
+                "AI 专属节点组 vs 默认海外代理组双出口分裂检测",
+                "FAIL",
+                f"claude.ai={claude_ip}({cf_loc}) ≠ 默认海外出口: {', '.join(diff_default[:3])}",
+                "致命分流分裂！claude.ai 走了 AI 专属代理组，但其他海外域名（包括 Stripe / hCaptcha / Google OAuth / Datadog / Sentry 所在的默认 PROXY 组）却走了另一台服务器或另一国家！同一次登录/支付中，Anthropic 与 Stripe/hCaptcha 看到两个完全不同的 IP 与国家，这是 Rule 分流模式下最高发的隐蔽封号原因之一！",
+                "使用 Claude 时切为 Global 全局模式，或将默认 PROXY 代理组与 AI 代理组选为同一个固定节点（并确保 stripe.com / stripe.network / hcaptcha.com / googleapis.com / statsig.anthropic.com 同组）。",
+                severity="critical",
+            )
+        )
+    elif claude_ip:
+        seen_same = [src for src, dip, _ in default_probes if dip == claude_ip]
+        leak_checks.append(
+            make_check(
+                "ai_vs_default_proxy_split",
+                "AI 专属节点组 vs 默认海外代理组双出口分裂检测",
+                "PASS",
+                f"AI 出口与常规海外出口完全一致 ({claude_ip} · 核验 {len(seen_same)} 源)",
+                "claude.ai 与通用海外接口走同一出口节点，不存在 AI 组与默认代理组分裂问题。",
             )
         )
 

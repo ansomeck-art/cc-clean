@@ -762,6 +762,130 @@
       fix_cmd: "",
     });
 
+    // 11. Canvas 2D & AudioContext Fingerprint Stability (Detects Noisy Anti-Fingerprinting Extensions)
+    const fnv1aHex = (str) => {
+      let h = 0x811c9dc5;
+      for (let i = 0; i < str.length; i++) {
+        h ^= str.charCodeAt(i);
+        h = Math.imul(h, 0x01000193);
+      }
+      return (h >>> 0).toString(16).padStart(8, "0");
+    };
+    const renderCanvasHash = () => {
+      try {
+        const c = document.createElement("canvas");
+        c.width = 240;
+        c.height = 50;
+        const ctx = c.getContext("2d");
+        if (!ctx) return "";
+        ctx.textBaseline = "top";
+        ctx.font = "14px Arial, sans-serif";
+        ctx.fillStyle = "#f60";
+        ctx.fillRect(10, 8, 90, 22);
+        ctx.fillStyle = "#069";
+        ctx.fillText("RegionGuard-FP-2026!", 14, 14);
+        ctx.strokeStyle = "rgba(102,204,0,0.7)";
+        ctx.beginPath();
+        ctx.arc(180, 25, 16, 0, Math.PI * 2);
+        ctx.stroke();
+        return fnv1aHex(c.toDataURL());
+      } catch (_) {
+        return "";
+      }
+    };
+    const renderAudioHash = async () => {
+      try {
+        const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+        if (!OAC) return "";
+        const ctx = new OAC(1, 4410, 44100);
+        const osc = ctx.createOscillator();
+        const comp = ctx.createDynamicsCompressor();
+        osc.type = "triangle";
+        osc.frequency.value = 10000;
+        comp.threshold.value = -50;
+        comp.knee.value = 40;
+        comp.ratio.value = 12;
+        comp.attack.value = 0;
+        comp.release.value = 0.25;
+        osc.connect(comp);
+        comp.connect(ctx.destination);
+        osc.start(0);
+        const buf = await ctx.startRendering();
+        const ch = buf.getChannelData(0);
+        let sum = 0;
+        for (let i = 2000; i < 2500; i++) sum += Math.abs(ch[i]);
+        return fnv1aHex(sum.toFixed(10));
+      } catch (_) {
+        return "";
+      }
+    };
+    const canvasH1 = renderCanvasHash();
+    const canvasH2 = renderCanvasHash();
+    const audioH1 = await renderAudioHash();
+    const audioH2 = await renderAudioHash();
+    const canvasNoisy = Boolean(canvasH1 && canvasH2 && canvasH1 !== canvasH2);
+    const audioNoisy = Boolean(audioH1 && audioH2 && audioH1 !== audioH2);
+    checks.push({
+      id: "browser_canvas_audio_fp",
+      title: "Canvas / AudioContext 硬件指纹哈希与防噪点篡改检测",
+      status: canvasNoisy || audioNoisy ? "FAIL" : "INFO",
+      severity: canvasNoisy || audioNoisy ? "high" : "low",
+      observed: `Canvas=${canvasH1 || "不可用"}${canvasNoisy ? " (不稳定/随机加噪!)" : " (稳定)"} | Audio=${audioH1 || "不可用"}${audioNoisy ? " (不稳定/随机加噪!)" : " (稳定)"}`,
+      detail:
+        canvasNoisy || audioNoisy
+          ? "检测到 Canvas 或 AudioContext 两次渲染结果不一致！说明浏览器开启了随机指纹加噪插件（如 CanvasBlocker / 指纹防追踪插件），Cloudflare Turnstile 与 hCaptcha 会把随机加噪直接判定为异常合成环境！"
+          : "Canvas 与 AudioContext 指纹渲染稳定（无加噪篡改）。提示：同一台电脑同一显卡下不同浏览器 Profile 的 Canvas/Audio 硬件哈希相同，若旧号刚被封禁，单换账号不换干净网络/Profile 仍可能被 Stripe Radar 辅助关联。",
+      fix_advice:
+        canvasNoisy || audioNoisy
+          ? "关闭 Canvas/Audio 随机防指纹扩展，使用原生无篡改的干净浏览器 Profile。"
+          : "",
+      fix_cmd: "",
+    });
+
+    // 12. WebGPU Adapter vs WebGL Cross-Check & Storage/Cookie Readiness
+    let webgpuStr = "不支持/未启用";
+    let webgpuMismatch = false;
+    try {
+      if (navigator.gpu && navigator.gpu.requestAdapter) {
+        const adapter = await navigator.gpu.requestAdapter();
+        if (adapter) {
+          const info = adapter.info || (adapter.requestAdapterInfo ? await adapter.requestAdapterInfo() : {});
+          const v = info.vendor || "";
+          const arch = info.architecture || "";
+          const desc = info.description || info.device || "";
+          webgpuStr = [v, arch, desc].filter(Boolean).join(" / ") || "WebGPU Adapter";
+          const glLow = webglStr.toLowerCase();
+          const gpuLow = webgpuStr.toLowerCase();
+          if (
+            (gpuLow.includes("nvidia") && !glLow.includes("nvidia")) ||
+            (gpuLow.includes("amd") && !glLow.includes("amd") && !glLow.includes("radeon")) ||
+            (gpuLow.includes("intel") && !glLow.includes("intel"))
+          ) {
+            webgpuMismatch = true;
+          }
+        }
+      }
+    } catch (_) {}
+    let quotaMb = "";
+    try {
+      if (navigator.storage && navigator.storage.estimate) {
+        const est = await navigator.storage.estimate();
+        if (est && est.quota) quotaMb = `${Math.round(est.quota / (1024 * 1024))} MB`;
+      }
+    } catch (_) {}
+    checks.push({
+      id: "browser_webgpu_storage",
+      title: "WebGPU 显卡交叉核验与浏览器存储配额",
+      status: webgpuMismatch ? "FAIL" : "INFO",
+      severity: webgpuMismatch ? "high" : "low",
+      observed: `WebGPU=${webgpuStr} | StorageQuota=${quotaMb || "-"}`,
+      detail: webgpuMismatch
+        ? `WebGPU 显卡 (${webgpuStr}) 与 WebGL (${webglStr}) 厂商不一致！说明存在 WebGL 伪装插件穿帮。`
+        : "WebGPU 与 WebGL 硬件栈一致（提示：无痕模式配额极小且每次重启清空验证令牌，新号建议使用独立常规 Profile 保持连续可信会话）。",
+      fix_advice: webgpuMismatch ? "关闭修改 WebGL 的指纹插件，保持原生显卡栈一致。" : "",
+      fix_cmd: "",
+    });
+
     return { title: "浏览器实时指纹实测 (当前浏览器直采)", checks };
   }
 

@@ -7,9 +7,10 @@
 1. **11 大 GeoIP 库 + WHOIS/RDAP/BGP/rDNS + 滥用信誉交叉验真**
    - 同步探测 Cloudflare (`claude.ai/cdn-cgi/trace` 含 `colo` 跨区 PoP 与 `WARP` 识别)、IPinfo、ip-api、**ipapi.is（机房/VPN/Proxy/Tor/滥用评分）**、ipwho.is、ip2location.io、api.ip.sb、db-ip、geojs.io、ifconfig.co、RIPE MaxMind。
    - 自动识别 IPXO 广播租赁段 (`geofeed`)、WHOIS 隐私马甲实体、跨国注册国家冲突、60+ 机房/VPS/机场商用共享 ASN、机房特征 rDNS、DNSBL 黑名单 (`Spamhaus` / `DroneBL` / `Barracuda` / `UCEPROTECT`)、Mullvad VPN 池与代理信誉库 (`blackbox` / `proxycheck`)。
-2. **全域名分流、Fake-IP 分叉、DNS/EDNS、IPv6、UDP/STUN 与断流风险**
+2. **全域名分流、AI 组 vs 默认组双出口分裂、Fake-IP 分叉、DNS/EDNS、IPv6、UDP/STUN 与断流风险**
    - 并行检测 `claude.ai`、`api.anthropic.com`、`a-api.anthropic.com`、`console.anthropic.com`、`platform.claude.com`、`code.claude.com`、`challenges.cloudflare.com` 是否同口同区，并验证 `m.stripe.network` (Stripe Radar)、`statsig.anthropic.com`、`api.hcaptcha.com`、`claude.com`、`appleid.apple.com`、`accounts.google.com` 等关键第三方接口。
-   - **本地 DNS 污染与 Fake-IP 分叉检测**：核查 `m.stripe.network`、`statsig.anthropic.com`、`api.hcaptcha.com` 是否被 `fake-ip-filter` 或去广告规则误放行/劫持。
+   - **AI 专属组 vs 默认海外组双出口分裂检测（致命红线）**：比对 `claude.ai` 出口 IP 与 `ipinfo.io` / `ip-api.com` / `ifconfig.co` / `ipleak.net` 出口 IP，精准捕获 Rule 模式下“AI 走节点 A、Stripe/hCaptcha/OAuth 走节点 B”的双出口分裂。
+   - **本地 DNS 污染、系统 DNS 缓存 (`displaydns`) 与 Fake-IP 分叉检测**：核查 `m.stripe.network`、`statsig.anthropic.com`、`api.hcaptcha.com` 是否被 `fake-ip-filter` 或去广告规则误放行/劫持。
    - 实测 `edns.ip-api.com` DNS 出口、IPv6 直连测试、UDP STUN 穿透测试、本机时钟偏差、**Windows 默认路由 Metric 优先级与 IPv6 默认路由**，以及物理网卡备用默认路由/私网 DNS（休眠唤醒瞬断风险）。
 3. **Clash / Mihomo / VPN 配置脱敏体检（Windows & macOS）**
    - 自动发现 Clash Verge Rev / Mihomo Party / Clash Party / FlClash / Clash Nyanpasu / Clash for Windows / macOS Clash 配置，检查代理模式 (`global`/`rule`)、DNS 上游 (`system`/国内 DNS)、`tun.strict-route`、`fake-ip-filter` 与 `DIRECT` 规则冲突、Windows WinINET/WinHTTP 代理与 `ProxyOverride` 绕过列表；绝不读取节点密码、UUID 或订阅 URL。
@@ -17,11 +18,12 @@
    - **Windows**：GeoID 国家代码、显示语言/区域格式/非 Unicode 代码页/安装 SKU、时区 (`tzutil`) 与**改时区后是否已重启校验** (`TimeZoneInformation` vs 系统开机时间)、自动时区 (`tzautoupdate`)、定位服务 (`ConsentStore` + `lfsvc`)、计算机名与中文用户目录名、TSF 中文输入法、**Claude 开机自启抢跑代理 (Boot-Leak)**、Modern Standby (S0) 与快速启动、IPv4/IPv6 网卡国内 DNS、hosts 劫持、MITM 抓包根证书与 WSL2 提醒。
    - **macOS**：`GlobalPreferences Country`、`AppleLocale`/`AppleLanguages`/`NSLinguisticDataAssetsRequested`、`/etc/localtime` 与开机时间对比、自动时区、定位服务 (`locationd`/`geod`)、主机名/NetBIOS、输入法、Wi-Fi 802.11d、Power Nap、Claude 开机自启、MITM 根证书。
 5. **Claude & 浏览器全路径指纹残留（纯只读元数据）**
-   - **Windows**：同时扫描传统 `%APPDATA%\Claude` **与官方 MSIX 虚拟化容器 `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\`** 的 `ant-did`、`Network\Cookies`（WAL 感知 + 进程锁检测防误报 PASS）、`Preferences`/`Local State`、`config.json`、`logs`；扫描 Claude Code CLI (`~/.claude.json`、`~/.claude/.credentials.json`、`settings.json` 中转变量、`%LOCALAPPDATA%\claude-cli-nodejs`)、Windows 凭据管理器 (`cmdkey /list` 正确处理中文 GBK/CP936 编码)、IDE 插件（VS Code / Cursor / Windsurf / Trae / Kiro / JetBrains）及 Chrome/Edge/Brave/Arc (MSIX)/Vivaldi/Opera/Firefox/Zen 的 Cookies、**IndexedDB 目录**、**Network Persistent State**、DoH 与代理扩展。
+   - **第三方中转站 / 本地转发桥 / 套壳 Harness 检测（致命红线）**：核查 `ANTHROPIC_BASE_URL`（环境变量 / `.claude/settings*.json`）、`apiKeyHelper` 与 `cc-switch` / `claude-code-router` 等转发工具。
+   - **Windows**：同时扫描传统 `%APPDATA%\Claude` **与官方 MSIX 虚拟化容器 `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\`** 及 `Claude-3p`/`Claude-Data`；扫描 `ant-did`、`Network\Cookies`（WAL 感知 + 进程锁检测防误报 PASS）、`Preferences`/`Local State`、`config.json`、`logs`；扫描 Claude Code CLI、Git 全局身份（脱敏）、Windows 凭据管理器 (`cmdkey /list`)、虚拟机 BIOS 与杀软 HTTPS 扫描进程（360/火绒/卡巴斯基等）、IDE 插件及 Chrome/Edge/Brave/Arc (MSIX)/Vivaldi/Opera/Firefox/Zen 的 Cookies、**IndexedDB**、**Network Persistent State**、隐藏的 **Chromium DIPS 追踪库**、History 域名、DoH 与代理扩展。
    - **macOS**：Desktop 10 类路径、`ant-did`、Cookies 追踪键、钥匙串全量脱敏检索、`~/Library` 12 子目录通配、Safari WebsiteData / ITP / DeviceIdHashSalts / Private Relay 与第三方浏览器扫描。
 6. **浏览器实时指纹实测 + 后台防断流守护**
    - 浏览器直出 IPv4/IPv6 (`api6.ipify.org`) 泄漏检测与后端通道一致性对比。
-   - HTTP `Accept-Language` 与 `navigator.language` 一致性、JS 时区防穿帮数学校验（含中文 `中国标准时间` 识别）、WebRTC ICE 实测、Geolocation 权限、深度 `Intl` (`Date`/`Number`/`Collator`/`RelativeTimeFormat`)、**`speechSynthesis.getVoices()` 隐藏中文系统语音泄漏检测**、**Canvas 中文字体指纹探测**、hCaptcha 多权限面板、自动化/Hook 篡改/WebGL 虚拟显卡/UA-CH 一致性检测。
+   - HTTP `Accept-Language` 与 `navigator.language` 一致性、JS 时区防穿帮数学校验（含中文 `中国标准时间` 识别）、WebRTC ICE 实测、Geolocation 权限、深度 `Intl` (`Date`/`Number`/`Collator`/`RelativeTimeFormat`)、**`speechSynthesis.getVoices()` 隐藏中文系统语音泄漏检测**、**Canvas 中文字体指纹探测**、**Canvas/AudioContext 稳定性防随机加噪穿帮检测**、**WebGPU vs WebGL 交叉核验**、hCaptcha 多权限面板、自动化/Hook 篡改/WebGL 虚拟显卡/UA-CH 一致性检测。
    - 支持 15s / 30s / 60s 后台 Python 守护线程持续监控 IP 跳变与休眠唤醒断流。
 
 ## 快速启动
