@@ -192,6 +192,7 @@ select {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 16px 18px;
+  min-width: 0;
 }
 
 .card-label {
@@ -699,6 +700,25 @@ select {
   border-color: rgba(16, 185, 129, 0.45);
   background: rgba(16, 185, 129, 0.08);
   color: #d1fae5;
+}
+
+/* Score Breakdown Panel */
+.breakdown-card {
+  margin-bottom: 16px;
+}
+
+.breakdown-scroll {
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.deduct-pts {
+  font-family: var(--mono);
+  font-weight: 700;
+  color: #fca5a5;
+}
+.deduct-pts.warn {
+  color: #fcd34d;
 }
 
 .toast {

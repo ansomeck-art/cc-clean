@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Region Guard — Local macOS Region, Network Leak & Risk Audit Web Server.
+Region Guard — Local Cross-Platform (Windows / macOS) Region, Network Leak & Risk Audit Web Server.
 
 Pure Python 3.9+ standard library backend bound strictly to 127.0.0.1.
 Strictly read-only against OS, browser, proxy, and application state;
@@ -14,7 +14,9 @@ import datetime
 import email.utils
 import http.server
 import json
+import locale
 import os
+import platform
 import plistlib
 import re
 import shutil
@@ -22,15 +24,67 @@ import socket
 import sqlite3
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 import urllib.parse
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
+IS_WINDOWS = sys.platform == "win32"
+IS_MACOS = sys.platform == "darwin"
+IS_LINUX = sys.platform.startswith("linux")
+PLATFORM_KEY = "windows" if IS_WINDOWS else ("macos" if IS_MACOS else "linux")
+CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
+
+if IS_WINDOWS:
+    import ctypes
+    import win_platform  # type: ignore
+else:
+    ctypes = None  # type: ignore
+    win_platform = None  # type: ignore
+
+
+def _detect_platform_label() -> str:
+    arch = platform.machine() or ""
+    if IS_WINDOWS:
+        rel = platform.release() or ""
+        try:
+            ver_parts = platform.version().split(".")
+            build = int(ver_parts[2]) if len(ver_parts) >= 3 else 0
+            if rel == "10" and build >= 22000:
+                rel = "11"
+        except Exception:
+            pass
+        return f"Windows {rel} ({arch})".strip()
+    if IS_MACOS:
+        mac_ver = platform.mac_ver()[0] or ""
+        return f"macOS {mac_ver} ({arch})".strip()
+    return f"{platform.system()} ({arch})".strip()
+
+
+PLATFORM_LABEL = _detect_platform_label()
+
+
+def _resolve_curl_bin() -> str:
+    if IS_WINDOWS:
+        sys32_curl = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "curl.exe")
+        if os.path.isfile(sys32_curl):
+            return sys32_curl
+        return shutil.which("curl.exe") or shutil.which("curl") or "curl.exe"
+    if IS_MACOS and os.path.isfile("/usr/bin/curl"):
+        return "/usr/bin/curl"
+    return shutil.which("curl") or "/usr/bin/curl"
+
+
+CURL_BIN = _resolve_curl_bin()
+WHOIS_BIN = ("/usr/bin/whois" if IS_MACOS and os.path.isfile("/usr/bin/whois") else (shutil.which("whois") or ""))
+
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-STATIC_DIR = os.path.join(BASE_DIR, "static")
+RESOURCE_DIR = getattr(sys, "_MEIPASS", BASE_DIR)
+RUNTIME_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else BASE_DIR
+STATIC_DIR = os.path.join(RESOURCE_DIR, "static")
 ALLOWED_STATIC = {
     "index.html": "text/html; charset=utf-8",
     "style.css": "text/css; charset=utf-8",
@@ -38,6 +92,29 @@ ALLOWED_STATIC = {
 }
 
 RESTRICTED_COUNTRIES = {"CN", "HK", "MO", "RU", "BY", "KP", "IR", "CU", "SY"}
+RESTRICTED_COLOS = {
+    "HKG", "MFM", "PVG", "PEK", "CAN", "SZX", "CTU", "SHA", "WUH", "TSN",
+    "CKG", "NKG", "XIY", "HGH", "FOC", "KMG", "TAO", "DLC", "SHE", "HRB",
+    "CGO", "CSX", "TNA", "SYX", "HAK", "URC", "LHW", "TYN", "HET", "INC",
+    "XMN", "DME", "SVO", "LED", "MSQ", "THR",
+}
+HOSTING_ASN_KEYWORDS = (
+    "SHARED-USE", "HOSTING", "CLOUD", "DATACENTER", "DATA CENTER", "SERVER",
+    "COLOCATION", "VPS", "VPN", "PROXY", "DIGITALOCEAN", "VULTR", "LINODE",
+    "AKAMAI", "OVH", "HETZNER", "AMAZON", "AWS", "GOOGLE", "MICROSOFT",
+    "AZURE", "ORACLE", "ALIBABA", "TENCENT", "HUAWEI", "BYTEDANCE", "VOLCENGINE",
+    "BAIDU", "UCLOUD", "KINGSOFT", "CLOUDFLARE", "FASTLY", "CONTABO", "CHOOPA",
+    "LEASEWEB", "M247", "DATACAMP", "PACKETHUB", "ZENLAYER", "DMIT", "BANDWAGON",
+    "IT7", "RACKNERD", "CLAWCLOUD", "NETCUP", "SCALEWAY", "UPCLOUD", "KAMATERA",
+    "IONOS", "GODADDY", "BLUEHOST", "CDN77", "G-CORE", "GCORE", "XTOM", "MISAKA",
+    "AKARI", "HYTRON", "BAGE", "NEAROUTE", "EONS", "COGENT", "HURRICANE",
+    "MULLVAD", "NORDVPN", "SURFSHARK", "EXPRESSVPN", "PROTON", "CYBERGHOST",
+)
+RDNS_HOSTING_KEYWORDS = (
+    "vps", "cloud", "server", "hosting", "datacenter", "proxy", "vpn", "exit",
+    "vultr", "linode", "amazonaws", "googleusercontent", "contaboserver",
+    "racknerd", "dmit", "hetzner", "ovh.", "digitalocean", "scaleway", "m247",
+)
 RESTRICTED_TIMEZONES = {
     "Asia/Shanghai",
     "Asia/Chongqing",
@@ -66,6 +143,10 @@ CN_DNS_SERVERS = {
     "182.254.116.116",
     "180.76.76.76",
     "1.2.4.8",
+    "2400:3200::1",
+    "2400:3200:baba::1",
+    "240c::6666",
+    "240c::6644",
 }
 
 TARGETS: Dict[str, Dict[str, Any]] = {
@@ -159,7 +240,7 @@ TARGETS: Dict[str, Dict[str, Any]] = {
 }
 
 
-PULSE_LOG_PATH = os.path.join(BASE_DIR, "pulse-events.jsonl")
+PULSE_LOG_PATH = os.path.join(RUNTIME_DIR, "pulse-events.jsonl")
 HISTORY_LOCK = threading.Lock()
 PULSE_HISTORY: Deque[Dict[str, Any]] = collections.deque(maxlen=200)
 BASELINE_IP: Optional[str] = None
@@ -169,22 +250,47 @@ def now_iso() -> str:
     return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
 
 
+def _decode_cmd_bytes(raw: bytes) -> str:
+    if not raw:
+        return ""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    if IS_WINDOWS and ctypes is not None:
+        try:
+            cp = ctypes.windll.kernel32.GetOEMCP()
+            if cp:
+                return raw.decode(f"cp{cp}", errors="replace")
+        except Exception:
+            pass
+    enc = locale.getpreferredencoding(False) or "utf-8"
+    return raw.decode(enc, errors="replace")
+
+
 def run_cmd(cmd: List[str], timeout: int = 8) -> Tuple[int, str, str]:
     try:
-        proc = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        return proc.returncode, proc.stdout, proc.stderr
+        kwargs: Dict[str, Any] = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "timeout": timeout,
+        }
+        if IS_WINDOWS:
+            kwargs["creationflags"] = CREATE_NO_WINDOW
+        proc = subprocess.run(cmd, **kwargs)
+        return proc.returncode, _decode_cmd_bytes(proc.stdout), _decode_cmd_bytes(proc.stderr)
     except subprocess.TimeoutExpired:
         return 124, "", "timeout"
     except Exception as exc:
         return 1, "", str(exc)
+
+
+def _curl_base_cmd(timeout: int) -> List[str]:
+    cmd = [CURL_BIN, "-sS", "--max-time", str(timeout)]
+    if IS_WINDOWS:
+        # Avoid Windows Schannel online CRL/OCSP revocation stalls behind proxies (keeps full TLS cert verification)
+        cmd.append("--ssl-no-revoke")
+    return cmd
 
 
 def curl_fetch(
@@ -193,8 +299,8 @@ def curl_fetch(
     ipv6_only: bool = False,
     head_only: bool = False,
 ) -> Tuple[bool, str, float, str]:
-    """Run /usr/bin/curl to match macOS system network & TLS trust stack."""
-    cmd = ["/usr/bin/curl", "-sSL", "--max-time", str(timeout)]
+    """Run system curl to match OS network & TLS trust stack (macOS SecureTransport / Windows Schannel)."""
+    cmd = _curl_base_cmd(timeout) + ["-L"]
     if ipv6_only:
         cmd.append("-6")
     if head_only:
@@ -481,6 +587,42 @@ def _query_geoip_ripe_maxmind(ip: str) -> Dict[str, Any]:
     }
 
 
+def _query_geoip_ipapi_is(ip: str) -> Dict[str, Any]:
+    """11th GeoIP + Fraud/Abuser/Datacenter/VPN/Tor reputation engine (free, no key)."""
+    ok, data, ms, err = curl_json(f"https://api.ipapi.is/?q={urllib.parse.quote(ip)}", timeout=6)
+    if not ok or not isinstance(data, dict) or "location" not in data:
+        return {"source": "ipapi.is", "status": "ERR", "error": err or "rate/err", "latency_ms": ms}
+    loc = data.get("location") or {}
+    asn = data.get("asn") or {}
+    comp = data.get("company") or {}
+    is_dc = bool(data.get("is_datacenter"))
+    is_vpn = bool(data.get("is_vpn"))
+    is_proxy = bool(data.get("is_proxy"))
+    is_tor = bool(data.get("is_tor"))
+    is_abuser = bool(data.get("is_abuser"))
+    org_txt = f"AS{asn.get('asn', '')} {asn.get('org') or comp.get('name') or ''}".strip()
+    return {
+        "source": "ipapi.is",
+        "ip": data.get("ip", ip),
+        "country": loc.get("country_code", ""),
+        "city": loc.get("city", ""),
+        "region": loc.get("state", ""),
+        "timezone": loc.get("timezone", ""),
+        "org": org_txt,
+        "proxy": is_vpn or is_proxy or is_tor or is_dc,
+        "is_datacenter": is_dc,
+        "is_vpn": is_vpn,
+        "is_proxy": is_proxy,
+        "is_tor": is_tor,
+        "is_abuser": is_abuser,
+        "company_type": str(comp.get("type") or ""),
+        "asn_type": str(asn.get("type") or ""),
+        "abuser_score": str(comp.get("abuser_score") or asn.get("abuser_score") or ""),
+        "latency_ms": ms,
+        "status": "OK",
+    }
+
+
 def _query_ripe_prefix(ip: str) -> Dict[str, Any]:
     url = f"https://stat.ripe.net/data/prefix-overview/data.json?resource={urllib.parse.quote(ip)}"
     ok, data, ms, err = curl_json(url, timeout=6)
@@ -504,7 +646,9 @@ def _query_proxycheck(ip: str) -> Dict[str, Any]:
 
 
 def _query_whois(ip: str) -> Dict[str, Any]:
-    rc, out, err = run_cmd(["/usr/bin/whois", ip], timeout=9)
+    if not WHOIS_BIN:
+        return {}
+    rc, out, err = run_cmd([WHOIS_BIN, ip], timeout=9)
     if rc != 0 and not out:
         return {"error": err}
     info: Dict[str, Any] = {
@@ -551,12 +695,15 @@ def _query_rdap(ip: str) -> Dict[str, Any]:
     ok, data, _, _ = curl_json(f"https://rdap.org/ip/{urllib.parse.quote(ip)}", timeout=6)
     if not ok or not isinstance(data, dict):
         return {}
-    out: Dict[str, Any] = {"countries": [], "netname": "", "org_names": [], "geofeed": ""}
+    out: Dict[str, Any] = {"countries": [], "netname": "", "org_names": [], "geofeed": "", "created": []}
     c = str(data.get("country") or "").strip().upper()
     if c:
         out["countries"].append(c)
     if data.get("name"):
         out["netname"] = str(data.get("name")).strip()
+    for ev in data.get("events") or []:
+        if isinstance(ev, dict) and ev.get("eventAction") in {"registration", "last changed"} and ev.get("eventDate"):
+            out["created"].append(f"{ev['eventAction']}:{str(ev['eventDate'])[:10]}")
     for link in data.get("links") or []:
         if isinstance(link, dict):
             href = str(link.get("href") or "")
@@ -589,7 +736,7 @@ def _query_rdap(ip: str) -> Dict[str, Any]:
 
 def _doh_query(name: str, qtype: str = "A", timeout: int = 5) -> Tuple[bool, Dict[str, Any]]:
     url = f"https://cloudflare-dns.com/dns-query?name={urllib.parse.quote(name)}&type={urllib.parse.quote(qtype)}"
-    cmd = ["/usr/bin/curl", "-sS", "--max-time", str(timeout), "-H", "Accept: application/dns-json", url]
+    cmd = _curl_base_cmd(timeout) + ["-H", "Accept: application/dns-json", url]
     rc, out, _ = run_cmd(cmd, timeout=timeout + 2)
     if rc != 0 or not out.strip():
         return False, {}
@@ -680,9 +827,9 @@ def _query_edns_reliable() -> Tuple[bool, Any, float, str]:
 
 
 def _probe_third_party(name: str, url: str, category: str = "risk") -> Dict[str, Any]:
-    cmd = ["/usr/bin/curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}|%{redirect_url}", "--max-time", "5", "-I", url]
+    cmd = _curl_base_cmd(8) + ["-o", os.devnull, "-w", "%{http_code}|%{redirect_url}", "-I", url]
     t0 = time.monotonic()
-    rc, out, err = run_cmd(cmd, timeout=7)
+    rc, out, err = run_cmd(cmd, timeout=10)
     ms = round((time.monotonic() - t0) * 1000.0, 1)
     parts = out.strip().split("|", 1)
     code_str = parts[0] if parts else ""
@@ -702,20 +849,16 @@ def _probe_third_party(name: str, url: str, category: str = "risk") -> Dict[str,
 
 
 def _probe_claude_edge_redirect() -> Dict[str, Any]:
-    cmd = [
-        "/usr/bin/curl",
-        "-sS",
+    cmd = _curl_base_cmd(8) + [
         "-D-",
         "-o",
-        "/dev/null",
+        os.devnull,
         "-w",
         "\n__RG_META__%{http_code}|%{redirect_url}",
-        "--max-time",
-        "6",
         "https://claude.ai/login",
     ]
     t0 = time.monotonic()
-    rc, out, err = run_cmd(cmd, timeout=8)
+    rc, out, err = run_cmd(cmd, timeout=10)
     ms = round((time.monotonic() - t0) * 1000.0, 1)
     hdrs, _, meta = out.rpartition("\n__RG_META__")
     parts = meta.strip().split("|", 1)
@@ -744,7 +887,9 @@ def _probe_claude_edge_redirect() -> Dict[str, Any]:
     }
 
 
-def _ntp_probe(host: str = "time.apple.com", port: int = 123) -> Dict[str, Any]:
+def _ntp_probe(host: str = "", port: int = 123) -> Dict[str, Any]:
+    if not host:
+        host = "time.windows.com" if IS_WINDOWS else "time.apple.com"
     sock = None
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -778,6 +923,7 @@ def _trace_domain(domain: str) -> Dict[str, Any]:
             "ip": "",
             "loc": "",
             "colo": "",
+            "warp": "off",
             "latency_ms": ms,
             "ok": False,
             "error": err,
@@ -790,9 +936,57 @@ def _trace_domain(domain: str) -> Dict[str, Any]:
         "colo": parsed.get("colo", ""),
         "http": parsed.get("http", ""),
         "tls": parsed.get("tls", ""),
+        "warp": parsed.get("warp", "off"),
+        "gateway": parsed.get("gateway", "off"),
+        "sni": parsed.get("sni", ""),
         "latency_ms": ms,
         "ok": True,
         "error": "",
+    }
+
+
+def _check_split_dns_resolution() -> Dict[str, Any]:
+    """
+    Resolve critical Anthropic/Stripe/hCaptcha/Statsig/Cloudflare domains via OS resolver
+    to detect DNS poisoning (0.0.0.0/127.0.0.1) or Fake-IP split divergence (e.g. claude.ai
+    gets 198.18.x.x Fake-IP while m.stripe.network or statsig.anthropic.com bypasses Fake-IP).
+    """
+    domains = [
+        "claude.ai",
+        "api.anthropic.com",
+        "statsig.anthropic.com",
+        "m.stripe.network",
+        "api.stripe.com",
+        "api.hcaptcha.com",
+        "challenges.cloudflare.com",
+    ]
+    resolved: Dict[str, str] = {}
+    poisoned: List[str] = []
+    fakeip_doms: List[str] = []
+    realip_doms: List[str] = []
+
+    def _is_fake_ip(ip: str) -> bool:
+        return ip.startswith(("198.18.", "198.19."))
+
+    for dom in domains:
+        try:
+            infos = socket.getaddrinfo(dom, 443, socket.AF_INET, socket.SOCK_STREAM)
+            ip = infos[0][4][0] if infos else ""
+            resolved[dom] = ip
+            if ip in {"0.0.0.0", "127.0.0.1"} or ip.startswith("127."):
+                poisoned.append(f"{dom}->{ip}")
+            elif _is_fake_ip(ip):
+                fakeip_doms.append(dom)
+            elif ip:
+                realip_doms.append(f"{dom}({ip})")
+        except Exception:
+            resolved[dom] = "ERR"
+
+    return {
+        "resolved": resolved,
+        "poisoned": poisoned,
+        "fakeip_domains": fakeip_doms,
+        "realip_domains": realip_doms,
     }
 
 
@@ -927,7 +1121,7 @@ def _check_dns_and_proxy_scutil() -> Dict[str, Any]:
 # Category 3: Clash / VPN Sanitized Config Inspection
 # ---------------------------------------------------------------------------
 def _safe_parse_clash_yaml(path: str) -> Dict[str, Any]:
-    """Extract only non-secret fields (mode, dns, ipv6, listeners, group names)."""
+    """Extract only non-secret fields (mode, dns, tun, ipv6, listeners, risk DIRECT rules, group names)."""
     result: Dict[str, Any] = {
         "exists": False,
         "mode": "",
@@ -937,6 +1131,12 @@ def _safe_parse_clash_yaml(path: str) -> Dict[str, Any]:
         "dns_nameserver": [],
         "dns_default_nameserver": [],
         "dns_proxy_server_nameserver": [],
+        "dns_fallback": [],
+        "tun_enable": None,
+        "tun_stack": "",
+        "tun_strict_route": None,
+        "fakeip_risk_filters": [],
+        "direct_risk_rules": [],
         "proxy_groups": [],
         "direct_listeners": [],
         "prepend_direct_count": 0,
@@ -950,6 +1150,7 @@ def _safe_parse_clash_yaml(path: str) -> Dict[str, Any]:
     except Exception:
         return result
 
+    risk_rule_kw = ("claude", "anthropic", "stripe", "hcaptcha", "cloudflare", "statsig", "sentry", "datadog")
     top_sec = ""
     sub_sec = ""
     base_indent = -1
@@ -987,19 +1188,40 @@ def _safe_parse_clash_yaml(path: str) -> Dict[str, Any]:
                 elif k == "enhanced-mode" and val:
                     result["dns_enhanced_mode"] = val
                     sub_sec = ""
-                elif k in {"nameserver", "default-nameserver", "proxy-server-nameserver"}:
+                elif k in {"nameserver", "default-nameserver", "proxy-server-nameserver", "fallback", "fake-ip-filter"}:
                     sub_sec = k
                 else:
                     sub_sec = ""
             elif s.startswith("-") and sub_sec:
                 val = s[1:].strip().strip('"').strip("'")
-                key_map = {
-                    "nameserver": "dns_nameserver",
-                    "default-nameserver": "dns_default_nameserver",
-                    "proxy-server-nameserver": "dns_proxy_server_nameserver",
-                }
-                if sub_sec in key_map and val:
-                    result[key_map[sub_sec]].append(val)
+                if sub_sec == "fake-ip-filter":
+                    if any(kw in val.lower() for kw in risk_rule_kw) and len(result["fakeip_risk_filters"]) < 8:
+                        result["fakeip_risk_filters"].append(val[:64])
+                else:
+                    key_map = {
+                        "nameserver": "dns_nameserver",
+                        "default-nameserver": "dns_default_nameserver",
+                        "proxy-server-nameserver": "dns_proxy_server_nameserver",
+                        "fallback": "dns_fallback",
+                    }
+                    if sub_sec in key_map and val:
+                        result[key_map[sub_sec]].append(val)
+        elif top_sec == "tun":
+            if ":" in s and not s.startswith("-"):
+                k, v = s.split(":", 1)
+                k = k.strip()
+                val = v.strip().strip('"').strip("'")
+                if k == "enable" and val:
+                    result["tun_enable"] = val.lower() == "true"
+                elif k == "stack" and val:
+                    result["tun_stack"] = val
+                elif k == "strict-route" and val:
+                    result["tun_strict_route"] = val.lower() == "true"
+        elif top_sec == "rules":
+            if s.startswith("-") and "direct" in low and any(kw in low for kw in risk_rule_kw):
+                val = s[1:].strip().strip('"').strip("'")
+                if len(result["direct_risk_rules"]) < 8:
+                    result["direct_risk_rules"].append(val[:72])
         elif top_sec == "proxy-groups":
             if s.startswith("- name:") or s.startswith("name:"):
                 val = s.split(":", 1)[1].strip().strip('"').strip("'")
@@ -1107,6 +1329,21 @@ def audit_clash_proxy() -> Dict[str, Any]:
                     "PASS",
                     dns_desc,
                     "未引用本地 system DNS，已使用独立上游 DNS。",
+                )
+            )
+
+        direct_risk_rules = parsed.get("direct_risk_rules") or []
+        fakeip_risk_filters = parsed.get("fakeip_risk_filters") or []
+        if direct_risk_rules or fakeip_risk_filters:
+            checks.append(
+                make_check(
+                    "clash_direct_risk_rules",
+                    "Clash 规则与 Fake-IP 放行冲突",
+                    "FAIL",
+                    f"DIRECT 命中 {len(direct_risk_rules)} 条 | fake-ip-filter 命中 {len(fakeip_risk_filters)} 条",
+                    f"检测到放行 Claude/风控域名的规则: {', '.join((direct_risk_rules + fakeip_risk_filters)[:5])}",
+                    "移除 anthropic / claude / stripe / hcaptcha / statsig / cloudflare 相关的 DIRECT 或 fake-ip-filter 条目。",
+                    severity="critical",
                 )
             )
 
@@ -1444,7 +1681,7 @@ def audit_macos_system(target_cfg: Dict[str, Any]) -> Dict[str, Any]:
                 host_obs,
                 f"检测到明显中文/拼音命名特征：{'; '.join(bad_host_reasons)}。Claude Desktop 会直接读取并上报为 remoteToolsDeviceName。",
                 "将 ComputerName、LocalHostName、HostName 及 SMB NetBIOSName 统一改为纯英文名称。",
-                'sudo scutil --set ComputerName "Anson-iMac" && sudo scutil --set LocalHostName "Anson-iMac" && sudo scutil --set HostName "Anson-iMac" && sudo defaults write /Library/Preferences/SystemConfiguration/com.apple.smb.server NetBIOSName -string "Anson-iMac"',
+                'sudo scutil --set ComputerName "My-Mac" && sudo scutil --set LocalHostName "My-Mac" && sudo scutil --set HostName "My-Mac" && sudo defaults write /Library/Preferences/SystemConfiguration/com.apple.smb.server NetBIOSName -string "My-Mac"',
                 severity="high",
             )
         )
@@ -1865,6 +2102,47 @@ def audit_macos_system(target_cfg: Dict[str, Any]) -> Dict[str, Any]:
             "Safari/浏览器网页沙箱无法读取主板 IOPlatformUUID；但原生 Claude Desktop 理论上可采集系统/硬件级特征。若本机曾被封号，新号建议优先使用全新独立浏览器配置文件（Safari 新 Profile），避免旧桌面端关联。",
         )
     )
+
+    # 19. Auto-start before VPN risk (LaunchAgents / openAtLogin)
+    mac_autostart: List[str] = []
+    la_dir = os.path.expanduser("~/Library/LaunchAgents")
+    if os.path.isdir(la_dir):
+        try:
+            for fn in os.listdir(la_dir):
+                if "claude" in fn.lower() or "anthropic" in fn.lower():
+                    mac_autostart.append(f"LaunchAgents/{fn}")
+        except Exception:
+            pass
+    c_cfg_p = os.path.expanduser("~/Library/Application Support/Claude/config.json")
+    if os.path.isfile(c_cfg_p):
+        try:
+            cd = json.load(open(c_cfg_p, "r", encoding="utf-8"))
+            if cd.get("openAtLogin") is True:
+                mac_autostart.append("Claude config.json openAtLogin=true")
+        except Exception:
+            pass
+    if mac_autostart:
+        checks.append(
+            make_check(
+                "claude_autostart_leak",
+                "Claude 开机自启抢跑代理风险 (Boot-Leak)",
+                "FAIL",
+                f"发现 {len(mac_autostart)} 项: {', '.join(mac_autostart[:3])}",
+                "Claude 开机自启可能早于 Clash/VPN TUN 建立连接，每次重启都会向 Anthropic 暴露真实本地 IP。",
+                "在 System Settings -> General -> Login Items 与 Claude Settings 中关闭开机自启。",
+                severity="high",
+            )
+        )
+    else:
+        checks.append(
+            make_check(
+                "claude_autostart_leak",
+                "Claude 开机自启抢跑代理风险 (Boot-Leak)",
+                "PASS",
+                "未发现 Claude 开机自启项",
+                "不存在 Claude 抢先于代理客户端联网的开机自启风险。",
+            )
+        )
 
     return {"title": "macOS 系统环境与指纹", "checks": checks}
 
@@ -2395,10 +2673,17 @@ def audit_claude_safari_residue() -> Dict[str, Any]:
         cc_status = "WARN"
         try:
             d = json.load(open(cc_json, "r", encoding="utf-8"))
-            flags = [k for k in ["machineID", "userID", "oauthAccount", "firstStartTime"] if k in d]
+            flags = [
+                k
+                for k in ["machineID", "userID", "oauthAccount", "anonymousId", "firstStartTime", "cachedStatsigGates", "cachedGrowthBookFeatures"]
+                if k in d
+            ]
             cc_notes.append(f"~/.claude.json 含 {', '.join(flags) if flags else '配置'}")
-            if any(k in d for k in ("machineID", "userID", "oauthAccount")):
+            if any(k in d for k in ("machineID", "userID", "oauthAccount", "anonymousId")):
                 cc_status = "FAIL"
+            projs = d.get("projects")
+            if isinstance(projs, dict) and any(has_cjk(str(pk)) for pk in projs.keys()):
+                cc_notes.append("projects 记录含中文路径")
         except Exception:
             cc_notes.append("~/.claude.json 存在")
     if cc_backups:
@@ -2409,10 +2694,24 @@ def audit_claude_safari_residue() -> Dict[str, Any]:
         sub_cc = []
         try:
             for item in sorted(os.listdir(cc_dir)):
-                if item in {"settings.json", "settings.local.json", "statsig", "projects", "debug", "ide", "credentials.json", ".credentials.json", "session-env", "file-history"}:
+                if item in {"settings.json", "settings.local.json", "statsig", "projects", "debug", "telemetry", "ide", "credentials.json", ".credentials.json", "session-env", "file-history"}:
                     sub_cc.append(item)
+            if ".credentials.json" in sub_cc or "credentials.json" in sub_cc:
+                cc_status = "FAIL"
         except Exception:
             pass
+        for sf in ("settings.json", "settings.local.json"):
+            sfp = os.path.join(cc_dir, sf)
+            if os.path.isfile(sfp):
+                try:
+                    sd = json.load(open(sfp, "r", encoding="utf-8"))
+                    s_env = sd.get("env") if isinstance(sd.get("env"), dict) else {}
+                    for ek in ("ANTHROPIC_BASE_URL", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+                        if s_env.get(ek):
+                            clean_ev = re.sub(r"://[^/@\s]+@", "://<REDACTED>@", str(s_env[ek]))
+                            cc_notes.append(f"{sf}:{ek}={clean_ev}")
+                except Exception:
+                    pass
         fcnt, fbytes = _dir_stats(cc_dir, max_files=1000)
         cc_notes.append(f"~/.claude/ ({fcnt} 文件, {_fmt_bytes(fbytes)}; 含 {', '.join(sub_cc[:6]) if sub_cc else '子项'})")
     if existing_xdg:
@@ -2906,6 +3205,53 @@ def audit_claude_safari_residue() -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Cross-Platform Helper Dispatch
+# ---------------------------------------------------------------------------
+def _check_tun_cross_platform() -> Tuple[bool, List[str], List[str], List[str]]:
+    if IS_WINDOWS and win_platform is not None:
+        return win_platform.win_check_tun_status()
+    if IS_MACOS:
+        return _check_utun_status()
+    # Basic Linux fallback
+    _, ip_out, _ = run_cmd(["ip", "-4", "route", "show", "default"], timeout=4)
+    routes = [l.strip() for l in ip_out.splitlines() if l.strip()]
+    tun_up = any(k in ip_out.lower() for k in ("tun", "utun", "meta", "mihomo", "clash", "wg", "198.18."))
+    return tun_up, [], routes, []
+
+
+def _audit_linux_system_basic(target_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    local_dt = datetime.datetime.now().astimezone()
+    offset_sec = int(local_dt.utcoffset().total_seconds()) if local_dt.utcoffset() else 0
+    tz_ok = offset_sec in target_cfg["utc_offsets_sec"]
+    checks = [
+        make_check(
+            "sys_timezone",
+            "Linux 系统时区偏移",
+            "PASS" if tz_ok else "WARN",
+            f"UTC{offset_sec/3600:+.1f} ({local_dt.tzname() or '-'})",
+            "Linux 基础环境检测（完整 OS 深度指纹体检目前支持 Windows 与 macOS）。",
+        )
+    ]
+    return {"title": "Linux 系统环境 (基础)", "checks": checks}
+
+
+def _audit_linux_residue_basic() -> Dict[str, Any]:
+    cc_json = os.path.expanduser("~/.claude.json")
+    cc_dir = os.path.expanduser("~/.claude")
+    has_cc = os.path.exists(cc_json) or os.path.exists(cc_dir)
+    checks = [
+        make_check(
+            "claude_code_cli",
+            "Claude Code CLI 状态 (~/.claude*)",
+            "WARN" if has_cc else "PASS",
+            "存在 ~/.claude* 配置" if has_cc else "0 残留",
+            "换新号前请清理 ~/.claude.json 与 ~/.claude 目录。" if has_cc else "未检测到 Claude Code CLI 残留。",
+        )
+    ]
+    return {"title": "Claude 本地文件残留 (Linux)", "checks": checks, "inventory": []}
+
+
+# ---------------------------------------------------------------------------
 # Full Scan Orchestrator
 # ---------------------------------------------------------------------------
 def run_full_scan(target_code: str) -> Dict[str, Any]:
@@ -2925,7 +3271,7 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
         "challenges.cloudflare.com",
     ]
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=40) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=44) as pool:
         # Phase A: immediate parallel launch
         f_primary = pool.submit(_trace_domain, "claude.ai")
         f_ipinfo = pool.submit(_query_geoip_ipinfo)
@@ -2938,25 +3284,49 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
         f_clock = pool.submit(_check_clock_drift)
         f_stun_cf = pool.submit(_stun_probe, "stun.cloudflare.com", 3478)
         f_stun_gg = pool.submit(_stun_probe, "stun.l.google.com", 19302)
-        f_ntp = pool.submit(_ntp_probe, "time.apple.com", 123)
+        f_ntp = pool.submit(_ntp_probe)
         f_edge = pool.submit(_probe_claude_edge_redirect)
+        f_split_dns = pool.submit(_check_split_dns_resolution)
         tp_specs = [
             ("Stripe JS", "https://js.stripe.com/v3/", "critical"),
             ("Stripe API", "https://api.stripe.com/", "critical"),
+            ("Stripe Radar", "https://m.stripe.network/", "critical"),
             ("hCaptcha JS", "https://js.hcaptcha.com/1/api.js", "critical"),
+            ("hCaptcha API", "https://api.hcaptcha.com/", "critical"),
             ("hCaptcha Assets", "https://newassets.hcaptcha.com/", "critical"),
             ("CF Turnstile", "https://challenges.cloudflare.com/turnstile/v0/api.js", "critical"),
+            ("Anthropic Statsig", "https://statsig.anthropic.com/", "critical"),
+            ("Claude Portal", "https://claude.com/", "critical"),
             ("Google OAuth", "https://accounts.google.com/Generate204", "critical"),
+            ("Apple OAuth", "https://appleid.apple.com/", "critical"),
             ("Datadog RUM", "https://browser-intake-us5-datadoghq.com/", "telemetry"),
             ("Sentry", "https://o1158394.ingest.us.sentry.io/", "telemetry"),
             ("Intercom", "https://widget.intercom.io/", "telemetry"),
         ]
         f_tp = [(name, pool.submit(_probe_third_party, name, url, cat)) for name, url, cat in tp_specs]
-        f_utun = pool.submit(_check_utun_status)
-        f_scutil = pool.submit(_check_dns_and_proxy_scutil)
-        f_clash = pool.submit(audit_clash_proxy)
-        f_macos = pool.submit(audit_macos_system, target_cfg)
-        f_residue = pool.submit(audit_claude_safari_residue)
+
+        # Platform-specific system, TUN, proxy & residue audits
+        if IS_WINDOWS and win_platform is not None:
+            f_win_tun = pool.submit(win_platform.win_check_tun_details)
+            f_scutil = pool.submit(win_platform.win_check_dns_and_proxy)
+            f_clash = pool.submit(win_platform.win_audit_clash_proxy, _safe_parse_clash_yaml)
+            f_os_sys = pool.submit(win_platform.win_audit_system, target_cfg)
+            f_residue = pool.submit(win_platform.win_audit_claude_browser_residue)
+            f_utun = None
+        elif IS_MACOS:
+            f_win_tun = None
+            f_utun = pool.submit(_check_utun_status)
+            f_scutil = pool.submit(_check_dns_and_proxy_scutil)
+            f_clash = pool.submit(audit_clash_proxy)
+            f_os_sys = pool.submit(audit_macos_system, target_cfg)
+            f_residue = pool.submit(audit_claude_safari_residue)
+        else:
+            f_win_tun = None
+            f_utun = pool.submit(_check_tun_cross_platform)
+            f_scutil = None
+            f_clash = None
+            f_os_sys = pool.submit(_audit_linux_system_basic, target_cfg)
+            f_residue = pool.submit(_audit_linux_residue_basic)
 
         f_domains = {d: pool.submit(_trace_domain, d) for d in cf_domains[1:]}
         f_cn1 = pool.submit(_check_cn_ip_url, "myip.ipip.net", "https://myip.ipip.net")
@@ -2984,6 +3354,7 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
             ip_futures["dbip"] = pool.submit(_query_geoip_dbip, egress_ip)
             ip_futures["geojs"] = pool.submit(_query_geoip_geojs, egress_ip)
             ip_futures["ripe_mm"] = pool.submit(_query_geoip_ripe_maxmind, egress_ip)
+            ip_futures["ipapi_is"] = pool.submit(_query_geoip_ipapi_is, egress_ip)
             ip_futures["ripe_pfx"] = pool.submit(_query_ripe_prefix, egress_ip)
             ip_futures["blackbox"] = pool.submit(_query_blackbox, egress_ip)
             ip_futures["proxycheck"] = pool.submit(_query_proxycheck, egress_ip)
@@ -3001,11 +3372,24 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
         stun_gg = f_stun_gg.result()
         ntp_res = f_ntp.result()
         edge_res = f_edge.result()
+        split_dns_res = f_split_dns.result()
         tp_results = [edge_res] + [fut.result() for _, fut in f_tp]
-        utun_up, utun_ips, default_routes, global_v6 = f_utun.result()
-        scutil_info = f_scutil.result()
-        cat_clash = f_clash.result()
-        cat_macos = f_macos.result()
+
+        win_tun_details: Optional[Dict[str, Any]] = None
+        if f_win_tun is not None:
+            win_tun_details = f_win_tun.result()
+            utun_up = bool(win_tun_details["tun_up"])
+            utun_ips = list(win_tun_details["tun_ips"])
+            default_routes = list(win_tun_details["default_routes"])
+            global_v6 = list(win_tun_details["global_v6"])
+        elif f_utun is not None:
+            utun_up, utun_ips, default_routes, global_v6 = f_utun.result()
+        else:
+            utun_up, utun_ips, default_routes, global_v6 = False, [], [], []
+
+        scutil_info = f_scutil.result() if f_scutil is not None else {"scoped_private_dns": []}
+        cat_clash = f_clash.result() if f_clash is not None else {"title": "代理配置", "checks": []}
+        cat_os_sys = f_os_sys.result()
         cat_residue = f_residue.result()
 
         domain_rows: List[Dict[str, Any]] = [primary_trace] + [f_domains[d].result() for d in cf_domains[1:]]
@@ -3017,6 +3401,7 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
         dbip_res = ip_futures["dbip"].result() if "dbip" in ip_futures else {"source": "db-ip.com", "status": "ERR", "error": "no ip"}
         geojs_res = ip_futures["geojs"].result() if "geojs" in ip_futures else {"source": "geojs.io", "status": "ERR", "error": "no ip"}
         ripe_mm_res = ip_futures["ripe_mm"].result() if "ripe_mm" in ip_futures else {"source": "RIPE MaxMind", "status": "ERR", "error": "no ip"}
+        ipapi_is_res = ip_futures["ipapi_is"].result() if "ipapi_is" in ip_futures else {"source": "ipapi.is", "status": "ERR", "error": "no ip"}
         ripe_pfx = ip_futures["ripe_pfx"].result() if "ripe_pfx" in ip_futures else {}
         blackbox = ip_futures["blackbox"].result() if "blackbox" in ip_futures else ""
         proxycheck = ip_futures["proxycheck"].result() if "proxycheck" in ip_futures else {}
@@ -3046,6 +3431,7 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
     # -----------------------------------------------------------------------
     # Build Category 1: ip_reputation
     # -----------------------------------------------------------------------
+    cf_warp = str(primary_trace.get("warp", "off") or "off").lower()
     cf_row = {
         "source": "Cloudflare (claude.ai)",
         "ip": primary_trace.get("ip", ""),
@@ -3053,8 +3439,8 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
         "city": f"colo={primary_trace.get('colo', '')}",
         "region": "",
         "timezone": "",
-        "org": f"{primary_trace.get('http', '')} / {primary_trace.get('tls', '')}".strip(" /"),
-        "proxy": primary_trace.get("warp", "off") != "off",
+        "org": f"{primary_trace.get('http', '')} / {primary_trace.get('tls', '')}" + (f" / WARP={cf_warp}" if cf_warp != "off" else ""),
+        "proxy": cf_warp != "off",
         "latency_ms": primary_trace.get("latency_ms", 0),
         "status": "OK" if primary_trace.get("ok") else "ERR",
         "error": primary_trace.get("error", ""),
@@ -3063,6 +3449,7 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
         cf_row,
         ipinfo_res,
         ipapi_res,
+        ipapi_is_res,
         ipwhois_res,
         ip2loc_res,
         ipsb_res,
@@ -3085,33 +3472,58 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
     ip_checks: List[Dict[str, str]] = []
     cf_loc = primary_trace.get("loc", "").upper()
     cf_colo = primary_trace.get("colo", "").upper()
+    expected_colos = set(target_cfg.get("expected_colos") or [])
     if not primary_trace.get("ok"):
         ip_checks.append(
             make_check(
                 "cf_trace",
-                "Cloudflare 入口归属 (claude.ai)",
+                "Cloudflare 入口归属与接入机房 (claude.ai)",
                 "FAIL",
                 primary_trace.get("error", "请求失败"),
                 "无法连接 claude.ai/cdn-cgi/trace，请检查代理连通性。",
-                "检查 Clash 节点是否可用。",
+                "检查代理客户端节点是否可用" + ("，并确认已开启 TUN 模式。" if IS_WINDOWS else "。"),
             )
         )
     elif cf_loc == target_cfg["code"]:
-        ip_checks.append(
-            make_check(
-                "cf_trace",
-                "Cloudflare 入口归属 (claude.ai)",
-                "PASS",
-                f"IP={egress_ip} | loc={cf_loc} | colo={cf_colo}",
-                f"Cloudflare 边缘识别国家码与目标地区 {target_cfg['code']} 一致。",
+        if cf_colo in RESTRICTED_COLOS:
+            ip_checks.append(
+                make_check(
+                    "cf_trace",
+                    "Cloudflare 入口归属与接入机房 (claude.ai)",
+                    "FAIL",
+                    f"IP={egress_ip} | loc={cf_loc} | colo={cf_colo} (受限区域机房!)",
+                    f"Cloudflare 识别国家为 {cf_loc}，但实际 BGP 接入机房为受限/高敏地区 PoP ({cf_colo})！极易在跨境广播路由或节点中转异常时触发风控。",
+                    f"更换实际落地接入 {target_cfg['name']} 本土机房（{', '.join(sorted(expected_colos)[:4])}）的原生节点。",
+                    severity="high",
+                )
             )
-        )
+        elif expected_colos and cf_colo and cf_colo not in expected_colos:
+            ip_checks.append(
+                make_check(
+                    "cf_trace",
+                    "Cloudflare 入口归属与接入机房 (claude.ai)",
+                    "WARN",
+                    f"IP={egress_ip} | loc={cf_loc} | colo={cf_colo} (跨区 PoP)",
+                    f"Cloudflare 识别国家与目标 {target_cfg['code']} 一致，但边缘接入机房 {cf_colo} 不在 {target_cfg['code']} 常见本土机房列表 ({', '.join(sorted(expected_colos)[:5])}) 内，常见于绕路/跨国广播段。",
+                    "若频繁弹人机盾或延迟高，建议更换本土直连机房节点。",
+                )
+            )
+        else:
+            ip_checks.append(
+                make_check(
+                    "cf_trace",
+                    "Cloudflare 入口归属与接入机房 (claude.ai)",
+                    "PASS",
+                    f"IP={egress_ip} | loc={cf_loc} | colo={cf_colo}" + (f" | WARP={cf_warp}" if cf_warp != "off" else ""),
+                    f"Cloudflare 边缘识别国家码与本土机房均与目标地区 {target_cfg['code']} 一致。",
+                )
+            )
     else:
         cf_sev = "critical" if cf_loc in RESTRICTED_COUNTRIES else "high"
         ip_checks.append(
             make_check(
                 "cf_trace",
-                "Cloudflare 入口归属 (claude.ai)",
+                "Cloudflare 入口归属与接入机房 (claude.ai)",
                 "FAIL",
                 f"IP={egress_ip} | loc={cf_loc or '?'} | colo={cf_colo or '?'}",
                 f"Cloudflare 将当前出口识别为 {cf_loc}，与目标 {target_cfg['code']} 不一致。",
@@ -3128,7 +3540,7 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
         ip_checks.append(
             make_check(
                 "geoip_consistency",
-                "10 大 GeoIP 数据库一致性",
+                "11 大 GeoIP 数据库一致性",
                 "FAIL",
                 f"{len(ok_dbs) - len(mismatch_dbs)}/{len(ok_dbs)} 一致；受限库: {desc}",
                 f"部分 GeoIP 数据库将该 IP 识别为受限地区（{desc}），Stripe/hCaptcha/风控极易直接拒签。",
@@ -3141,7 +3553,7 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
         ip_checks.append(
             make_check(
                 "geoip_consistency",
-                "10 大 GeoIP 数据库一致性",
+                "11 大 GeoIP 数据库一致性",
                 "WARN",
                 f"{len(ok_dbs) - len(mismatch_dbs)}/{len(ok_dbs)} 一致；冲突: {desc}",
                 f"存在多库归属冲突（{desc}），常见于跨国广播/过户未同步的租赁段，部分第三方风控库仍按旧归属判定。",
@@ -3153,16 +3565,16 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
         ip_checks.append(
             make_check(
                 "geoip_consistency",
-                "10 大 GeoIP 数据库一致性",
+                "11 大 GeoIP 数据库一致性",
                 "PASS",
                 f"{len(ok_dbs)}/{len(ok_dbs)} 全部匹配 {target_cfg['code']}",
                 "所有已响应的 GeoIP 数据库均一致归属目标国家。",
             )
         )
     else:
-        ip_checks.append(make_check("geoip_consistency", "10 大 GeoIP 数据库一致性", "FAIL", "全部查询失败", "无法核验 GeoIP。", severity="high"))
+        ip_checks.append(make_check("geoip_consistency", "11 大 GeoIP 数据库一致性", "FAIL", "全部查询失败", "无法核验 GeoIP。", severity="high"))
 
-    # Broadcast / Leased / Proxy / ASN reputation check
+    # Broadcast / Leased / Proxy / Datacenter / Fraud Score / ASN / WARP reputation check
     rep_flags: List[str] = []
     geofeed = whois_info.get("geofeed", "")
     org_names = whois_info.get("org_names") or []
@@ -3173,7 +3585,11 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
         asn_str = f"AS{asn_list[0].get('asn', '')} {asn_list[0].get('holder', '')}"
     elif ipinfo_res.get("org"):
         asn_str = ipinfo_res.get("org", "")
+    elif ipapi_is_res.get("org"):
+        asn_str = ipapi_is_res.get("org", "")
 
+    if cf_warp != "off":
+        rep_flags.append(f"经由 Cloudflare WARP 出口 (warp={cf_warp}，高度共享易触发风控)")
     if "ipxo" in geofeed.lower():
         rep_flags.append(f"IPXO 租赁广播段 (geofeed={geofeed})")
     if any(re.match(r"^Company\s+[0-9A-Za-z]{10,}$", n) for n in org_names):
@@ -3184,12 +3600,27 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
     il_reg = str(ipleak_res.get("registered_country_code") or "").upper()
     if il_cc and il_reg and il_cc != il_reg:
         rep_flags.append(f"跨国广播段 (ipleak 使用地={il_cc}, 注册地={il_reg})")
-    if any(k in asn_str.upper() for k in ["SHARED-USE", "HOSTING", "CLOUD", "DIGITALOCEAN", "VULTR", "LINODE", "OVH", "HETZNER", "AMAZON", "GOOGLE", "MICROSOFT", "ORACLE", "ALIBABA", "TENCENT"]):
-        rep_flags.append(f"商用/共享传输 ASN ({asn_str})")
+    if any(k in asn_str.upper() for k in HOSTING_ASN_KEYWORDS):
+        rep_flags.append(f"机房/云厂商/商用共享 ASN ({asn_str})")
     if blackbox == "Y":
         rep_flags.append("ipinfo blackbox 标记为代理/VPN")
     if proxycheck.get("proxy") == "yes" or ipapi_res.get("proxy") or ip2loc_res.get("proxy") is True:
         rep_flags.append(f"代理风险库标记 (proxycheck={proxycheck.get('proxy')}, type={proxycheck.get('type')})")
+    if ipapi_is_res.get("status") == "OK":
+        is_tags: List[str] = []
+        if ipapi_is_res.get("is_tor"):
+            is_tags.append("Tor出口")
+        if ipapi_is_res.get("is_abuser"):
+            is_tags.append("滥用记录(is_abuser)")
+        if ipapi_is_res.get("is_vpn"):
+            is_tags.append("VPN")
+        if ipapi_is_res.get("is_proxy"):
+            is_tags.append("Proxy")
+        if ipapi_is_res.get("is_datacenter") or ipapi_is_res.get("company_type") == "hosting":
+            is_tags.append(f"机房({ipapi_is_res.get('company_type') or 'datacenter'})")
+        if is_tags:
+            score_s = f", abuser_score={ipapi_is_res.get('abuser_score')}" if ipapi_is_res.get("abuser_score") else ""
+            rep_flags.append(f"ipapi.is 风险标记: {'/'.join(is_tags)}{score_s}")
     pc_type = str(proxycheck.get("type", "")).strip()
     if pc_type and pc_type.lower() not in {"residential", "wireless", "mobile"}:
         rep_flags.append(f"IP 类型为 {pc_type}（非原生民用住宅宽带）")
@@ -3198,28 +3629,49 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
         rep_flags.append(f"多库城市/时区不一致 ({', '.join(sorted(tz_set))})")
     if not rdns:
         rep_flags.append("无 PTR 反向解析 (rDNS)")
+    elif any(k in rdns.lower() for k in RDNS_HOSTING_KEYWORDS):
+        rep_flags.append(f"rDNS 含机房/VPS 命名特征 ({rdns})")
 
-    if rep_flags:
-        is_hard_proxy = (blackbox == "Y" or proxycheck.get("proxy") == "yes")
+    if not egress_ip:
         ip_checks.append(
             make_check(
                 "ip_reputation_signals",
-                "IP 广播租赁 / 机房 / 代理信誉检测",
+                "IP 广播租赁 / 机房 / 滥用评分 / 代理信誉检测",
+                "INFO",
+                "未获取到出口 IP，跳过信誉检测",
+                "请先确认网络与代理连通性。",
+            )
+        )
+    elif rep_flags:
+        is_tor_or_abuser = bool(ipapi_is_res.get("is_tor") or ipapi_is_res.get("is_abuser"))
+        is_hard_proxy = (
+            blackbox == "Y"
+            or proxycheck.get("proxy") == "yes"
+            or bool(ipapi_is_res.get("is_vpn"))
+            or bool(ipapi_is_res.get("is_proxy"))
+            or is_tor_or_abuser
+            or cf_warp != "off"
+        )
+        ip_checks.append(
+            make_check(
+                "ip_reputation_signals",
+                "IP 广播租赁 / 机房 / 滥用评分 / 代理信誉检测",
                 "FAIL" if is_hard_proxy else "WARN",
                 f"命中 {len(rep_flags)} 项风险特征",
-                "；".join(rep_flags) + "。此类 IP 虽常被标为“住宅 IP”，但极易在风控模型中暴露广播租赁/商业共享属性。",
-                "如用于长期高敏感账号，建议选用目标国本土宽带运营商直出 IP。",
-                severity="high" if is_hard_proxy else "low",
+                "；".join(rep_flags) + "。此类 IP 虽常被标为“住宅 IP”，但极易在 Cloudflare / Stripe / Anthropic 风控模型中暴露广播租赁、机房或滥用属性。",
+                "如用于长期高敏感 Claude 账号，建议选用目标国本土宽带运营商（ISP 类型）静态独享 IP。",
+                severity="critical" if is_tor_or_abuser else ("high" if is_hard_proxy else "low"),
             )
         )
     else:
+        comp_t = ipapi_is_res.get("company_type") or "isp"
         ip_checks.append(
             make_check(
                 "ip_reputation_signals",
-                "IP 广播租赁 / 机房 / 代理信誉检测",
+                "IP 广播租赁 / 机房 / 滥用评分 / 代理信誉检测",
                 "PASS",
-                f"ASN={asn_str or '-'} | rDNS={rdns or '-'}",
-                "未命中常见 IPXO 广播租赁、数据中心或高风险代理特征。",
+                f"ASN={asn_str or '-'} | 类型={comp_t} | rDNS={rdns or '-'}",
+                "未命中 IPXO 广播租赁、数据中心、滥用评分、WARP 或高风险代理特征。",
             )
         )
 
@@ -3232,6 +3684,8 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
     all_bl_hits = dnsbl_hits + ([f"Mullvad-BL({', '.join(mullvad_hits)})"] if mullvad_is_bl else [])
     if mullvad_exit:
         all_bl_hits.append("Mullvad 已知 VPN 出口节点")
+    if ipapi_is_res.get("is_tor"):
+        all_bl_hits.append("Tor 出口节点")
 
     bl_notes: List[str] = []
     if dnsbl_res.get("pbl_residential"):
@@ -3240,32 +3694,44 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
         bl_notes.append("Spamhaus 公共DNS限流跳过")
     if mullvad_res:
         bl_notes.append("Mullvad库已核验")
+    if ipapi_is_res.get("status") == "OK" and ipapi_is_res.get("abuser_score"):
+        bl_notes.append(f"ipapi.is={ipapi_is_res['abuser_score']}")
 
     if all_bl_hits:
         ip_checks.append(
             make_check(
                 "ip_dnsbl",
-                "IP 滥用黑名单与高风险 VPN 池 (DNSBL + Mullvad)",
+                "IP 滥用黑名单与高风险 VPN/Tor 池 (DNSBL + Mullvad + ipapi.is)",
                 "FAIL",
                 f"命中黑名单 {len(all_bl_hits)} 项: {', '.join(all_bl_hits)}",
-                "当前出口 IP 已被列入公共滥用/肉鸡黑名单或公开商业 VPN 出口库，极易直接触发高风控拦截。",
+                "当前出口 IP 已被列入公共滥用/肉鸡黑名单、Tor 或公开商业 VPN 出口库，极易直接触发高风控拦截。",
                 "立即更换干净且不在公共黑名单中的代理节点。",
                 severity="critical",
+            )
+        )
+    elif dnsbl_res.get("checked", 0) == 0 and not mullvad_res and ipapi_is_res.get("status") != "OK":
+        ip_checks.append(
+            make_check(
+                "ip_dnsbl",
+                "IP 滥用黑名单与高风险 VPN/Tor 池 (DNSBL + Mullvad + ipapi.is)",
+                "INFO",
+                "黑名单库查询超时/不可达 (0 已核验)",
+                "当前无法访问公共 DNSBL / Mullvad / ipapi.is 接口，请确认代理联网后重试。",
             )
         )
     else:
         ip_checks.append(
             make_check(
                 "ip_dnsbl",
-                "IP 滥用黑名单与高风险 VPN 池 (DNSBL + Mullvad)",
+                "IP 滥用黑名单与高风险 VPN/Tor 池 (DNSBL + Mullvad + ipapi.is)",
                 "PASS",
                 f"已核验 {dnsbl_res.get('checked', 0)} 个 DNSBL 库" + (f" · {', '.join(bl_notes)}" if bl_notes else ""),
-                "未命中 DroneBL、Barracuda、UCEPROTECT、Spamhaus(非PBL) 与 Mullvad 黑名单。",
+                "未命中 DroneBL、Barracuda、UCEPROTECT、Spamhaus(非PBL)、Mullvad 与 Tor 黑名单。",
             )
         )
 
     # IP Timezone check against target
-    ip_tz = ipinfo_res.get("timezone") or ipapi_res.get("timezone") or geojs_res.get("timezone") or ""
+    ip_tz = ipinfo_res.get("timezone") or ipapi_res.get("timezone") or ipapi_is_res.get("timezone") or geojs_res.get("timezone") or ""
     if ip_tz:
         tz_match = ip_tz in target_cfg["timezones"]
         ip_checks.append(
@@ -3278,6 +3744,7 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
             )
         )
 
+    pc_or_is_type = proxycheck.get("type") or ipapi_is_res.get("company_type") or "未知"
     egress_summary = {
         "ip": egress_ip,
         "loc": cf_loc,
@@ -3288,7 +3755,8 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
         "geofeed": geofeed or "无",
         "whois_countries": ", ".join(whois_countries) if whois_countries else "未知",
         "whois_orgs": ", ".join(org_names) if org_names else "未知",
-        "proxy_type": proxycheck.get("type", "未知"),
+        "proxy_type": pc_or_is_type,
+        "abuser_score": ipapi_is_res.get("abuser_score", "") or "-",
     }
 
     # -----------------------------------------------------------------------
@@ -3323,7 +3791,57 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
                 "FAIL",
                 f"存在分流/失败域名: {', '.join(bad_doms) if bad_doms else f'多出口 IP {cf_ips}'}",
                 "部分 Anthropic 或 Cloudflare 域名未走同一目标节点，会导致服务端与验证服务看到不同 IP/国家。",
-                "确保所有 anthropic.com / claude.ai / claude.com / cloudflare.com / stripe.com / hcaptcha.com / sentry.io 走同一节点。",
+                "确保所有 anthropic.com / claude.ai / claude.com / cloudflare.com / stripe.com / stripe.network / hcaptcha.com / statsig.anthropic.com 走同一节点。",
+            )
+        )
+
+    # Split-DNS / Fake-IP Divergence Check (catches stripe.network / statsig.anthropic.com bypassing Fake-IP!)
+    poisoned_dns = split_dns_res.get("poisoned") or []
+    fakeip_doms = split_dns_res.get("fakeip_domains") or []
+    realip_doms = split_dns_res.get("realip_domains") or []
+    if poisoned_dns:
+        leak_checks.append(
+            make_check(
+                "split_dns_divergence",
+                "风控关键域名本地 DNS 污染与 Fake-IP 分叉检测",
+                "FAIL",
+                f"命中 DNS 污染/劫持: {', '.join(poisoned_dns)}",
+                "关键风控/遥测域名被解析至 0.0.0.0 或 127.0.0.1（常见于广告屏蔽规则或本地 hosts 误杀 Stripe/Statsig/hCaptcha）。",
+                "检查 hosts、AdGuard、Clash 去广告规则，放行 stripe.network / statsig.anthropic.com / hcaptcha.com。",
+                severity="high",
+            )
+        )
+    elif fakeip_doms and realip_doms:
+        leak_checks.append(
+            make_check(
+                "split_dns_divergence",
+                "风控关键域名本地 DNS 污染与 Fake-IP 分叉检测",
+                "WARN",
+                f"Fake-IP({len(fakeip_doms)}域) 与 真实IP({', '.join(realip_doms[:4])}) 混杂分叉",
+                "部分核心域名（如 claude.ai）走了 Clash Fake-IP，但 m.stripe.network / statsig.anthropic.com / hCaptcha 等返回了真实公网 IP，可能被 fake-ip-filter 放行并走直连造成 IP 分裂！",
+                "检查 Clash 的 fake-ip-filter 与分流规则，确保 stripe.network、statsig.anthropic.com、hcaptcha.com 与 claude.ai 同走代理。",
+                severity="high",
+            )
+        )
+    elif not fakeip_doms and not realip_doms:
+        leak_checks.append(
+            make_check(
+                "split_dns_divergence",
+                "风控关键域名本地 DNS 污染与 Fake-IP 分叉检测",
+                "WARN",
+                "本地 DNS 解析全部失败 (0/7)",
+                "无法通过系统 DNS 解析 claude.ai / stripe.network / statsig.anthropic.com，请检查本机 DNS 或代理状态。",
+            )
+        )
+    else:
+        mode_tag = f"全部统一 Fake-IP ({len(fakeip_doms)}/7)" if fakeip_doms else f"全部统一真实解析 ({len(realip_doms)}/7)"
+        leak_checks.append(
+            make_check(
+                "split_dns_divergence",
+                "风控关键域名本地 DNS 污染与 Fake-IP 分叉检测",
+                "PASS",
+                mode_tag,
+                "claude.ai、api.anthropic.com、statsig.anthropic.com、m.stripe.network、api.stripe.com、api.hcaptcha.com、challenges.cloudflare.com 解析模式一致且无 DNS 劫持。",
             )
         )
 
@@ -3422,18 +3940,18 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
         leak_checks.append(
             make_check(
                 "third_party_endpoints",
-                "第三方风控 / 支付 / 人机验证接口连通性",
+                "第三方风控 / 支付 / Statsig / 人机验证接口连通性",
                 "FAIL",
                 f"关键接口异常 {len(crit_fail)} 项 ({', '.join(r['name'] for r in crit_fail)})",
-                f"{tp_summary}。Stripe/hCaptcha/Turnstile/Google OAuth 加载失败会直接导致支付报错（如 Failed to load Stripe.js）或人机验证卡死。",
-                "检查节点链路质量或分流规则，确保 stripe.com、hcaptcha.com、challenges.cloudflare.com 畅通。",
+                f"{tp_summary}。Stripe / m.stripe.network / hCaptcha / Statsig / OAuth 加载失败会直接导致支付风控拒付或人机验证失败。",
+                "检查节点链路质量或分流规则，确保 stripe.com、stripe.network、hcaptcha.com、statsig.anthropic.com、challenges.cloudflare.com 畅通。",
             )
         )
     elif tele_fail:
         leak_checks.append(
             make_check(
                 "third_party_endpoints",
-                "第三方风控 / 支付 / 人机验证接口连通性",
+                "第三方风控 / 支付 / Statsig / 人机验证接口连通性",
                 "WARN",
                 f"遥测/客服接口异常 ({', '.join(r['name'] for r in tele_fail)})",
                 tp_summary,
@@ -3443,7 +3961,7 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
         leak_checks.append(
             make_check(
                 "third_party_endpoints",
-                "第三方风控 / 支付 / 人机验证接口连通性",
+                "第三方风控 / 支付 / Statsig / 人机验证接口连通性",
                 "PASS",
                 f"{ok_tp_cnt}/{len(tp_only)} 第三方风控与支付域名全通",
                 tp_summary,
@@ -3469,7 +3987,7 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
                 "国内探测点路由方向 (myip.ipip.net / 3322)",
                 "INFO",
                 f"走直连 ({', '.join(set(cn_ips))})",
-                "国内域名正在直连（规则分流）。请确认分流规则不会漏掉任何海外验证/统计域名，且 DNS 不泄漏。",
+                "国内域名正在直连（规则分流）。请确认分流规则不会漏掉任何海外验证/统计域名（如 stripe.network / statsig.anthropic.com），且 DNS 不泄漏。",
             )
         )
     else:
@@ -3562,7 +4080,7 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
                     "FAIL",
                     f"真实 IPv6={v6_ip}, loc={v6_loc or '?'} | 本机公网v6={global_v6 or '无'}",
                     f"真实 IPv6 流量未走目标地区 {target_cfg['code']}，可能直接通过本地运营商 IPv6 泄漏！",
-                    "在系统网络设置或 Clash 中禁用 IPv6（ipv6: false）。",
+                    "在系统网卡属性或 Clash 中禁用 IPv6（ipv6: false）。",
                     severity="critical",
                 )
             )
@@ -3574,7 +4092,7 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
                     "IPv6 防泄漏检测",
                     "WARN",
                     f"外网 v6 不可达，但本机存在公网 v6: {', '.join(global_v6)}",
-                    "curl -6 超时未泄漏，但网卡分配了公网 IPv6 地址，建议彻底关闭 IPv6 以防部分程序走直连。",
+                    "curl -6 超时未泄漏，但网卡分配了公网 IPv6 地址，建议彻底关闭 IPv6 以防浏览器 Happy Eyeballs 或部分程序走直连。",
                     severity="high",
                 )
             )
@@ -3625,7 +4143,7 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
                 "FAIL",
                 f"UDP 返回 {set(stun_ips)} != TCP {egress_ip} | {ntp_note}",
                 "致命泄漏！UDP STUN 返回的公网 IP 与 TCP 出口不同，说明 UDP 流量正在绕过代理直连（会直接暴露真实所在地 IP）。",
-                "在代理客户端开启 UDP 转发，或在浏览器中禁用 WebRTC 非代理 UDP。",
+                "在代理客户端开启 TUN + UDP 转发，或在浏览器中禁用 WebRTC 非代理 UDP。",
                 severity="critical",
             )
         )
@@ -3647,49 +4165,102 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
     else:
         leak_checks.append(make_check("clock_drift", "本机 UTC 时钟同步误差", "INFO", "无法获取响应头", str(clock_res.get("error", ""))))
 
-    # Tunnel & Kill-Switch route audit
-    non_utun_defaults = [r for r in default_routes if "utun" not in r]
-    if not utun_up:
-        leak_checks.append(
-            make_check(
-                "killswitch_routes",
-                "TUN 隧道与断流保护 (Kill-Switch) 风险",
-                "FAIL",
-                f"未检测到 utun 默认路由；路由={default_routes}",
-                "当前流量未走虚拟网卡 TUN 接管，极易在未挂代理环境变量的客户端中直连。",
-                "请在 Clash 中开启 Enhanced Mode / TUN 模式。",
+    # Tunnel & Kill-Switch route audit (Platform-Aware: Windows vs macOS)
+    if IS_WINDOWS and win_tun_details is not None:
+        non_tun_defaults = win_tun_details["non_tun_defaults"]
+        tun_lowest = win_tun_details["tun_has_lowest_metric"]
+        v6_def = win_tun_details["ipv6_default_routes"]
+        phys_priv_dns = win_tun_details["physical_private_dns"]
+        if not utun_up:
+            leak_checks.append(
+                make_check(
+                    "killswitch_routes",
+                    "TUN 隧道与断流保护 (Kill-Switch) 风险",
+                    "FAIL",
+                    f"未检测到 Windows TUN 虚拟网卡；路由={default_routes[:3]}",
+                    "当前未启用 TUN 虚拟网卡接管（可能仅开了系统代理或直连），Claude Code CLI、UDP 及非 WinINET 应用极易直连漏 IP。",
+                    "在 Clash Verge Rev / Mihomo Party / v2rayN 中以管理员或服务模式开启 TUN 模式。",
+                    severity="high",
+                )
             )
-        )
-    elif non_utun_defaults or scutil_info["scoped_private_dns"]:
-        leak_checks.append(
-            make_check(
-                "killswitch_routes",
-                "TUN 隧道与断流保护 (Kill-Switch) 风险",
-                "WARN",
-                f"TUN 活跃 ({', '.join(utun_ips)})，但底层网卡仍有默认路由/私网 DNS",
-                f"存在物理网卡默认路由 {non_utun_defaults} 及 Scoped DNS {scutil_info['scoped_private_dns']}。平时走 TUN 没问题，但 Mac 休眠唤醒或 Clash 重载瞬间，后台客户端会立刻走物理网卡直连漏出真实 IP！",
-                "Mac 休眠前先退出 Claude Desktop，或确保 Clash 开启严格的断网保护规则。",
+        elif not tun_lowest:
+            leak_checks.append(
+                make_check(
+                    "killswitch_routes",
+                    "TUN 隧道与断流保护 (Kill-Switch) 风险",
+                    "FAIL",
+                    f"TUN 网卡存在 ({', '.join(utun_ips)})，但默认路由跃点数 (Metric) 高于物理网卡！",
+                    f"当前默认路由: {default_routes}。Windows 优先选择 Metric 最小的默认路由，物理网卡优先级高于 TUN 会导致流量绕过 TUN 直连！",
+                    "重启代理客户端的 TUN 模式并开启 auto-route / strict-route，确保 TUN 默认路由 Metric 最低。",
+                    severity="critical",
+                )
             )
-        )
+        elif non_tun_defaults or phys_priv_dns or v6_def:
+            leak_checks.append(
+                make_check(
+                    "killswitch_routes",
+                    "TUN 隧道与断流保护 (Kill-Switch) 风险",
+                    "WARN",
+                    f"TUN 接管中 ({', '.join(utun_ips)}，最低 Metric)，底层网卡保留备用默认路由/私网 DNS",
+                    f"存在物理网卡默认路由 {non_tun_defaults[:3]} 及物理私网 DNS {phys_priv_dns[:3]}。"
+                    + (f" 且存在 IPv6 默认路由 {v6_def[:2]}。" if v6_def else "")
+                    + " 平时走 TUN 正常，但 Windows 休眠唤醒或代理重启瞬间，后台程序会走物理网卡直连漏出真实 IP！",
+                    "休眠/合盖前退出 Claude Desktop，并确保代理客户端开启 strict-route 与服务模式自启。",
+                )
+            )
+        else:
+            leak_checks.append(
+                make_check(
+                    "killswitch_routes",
+                    "TUN 隧道与断流保护 (Kill-Switch) 风险",
+                    "PASS",
+                    f"TUN 接管中 ({', '.join(utun_ips)})",
+                    "默认路由与 DNS 均由 Windows TUN 独占接管。",
+                )
+            )
     else:
-        leak_checks.append(
-            make_check(
-                "killswitch_routes",
-                "TUN 隧道与断流保护 (Kill-Switch) 风险",
-                "PASS",
-                f"TUN 接管中 ({', '.join(utun_ips)})",
-                "默认路由与 DNS 均由 TUN 接管。",
+        non_utun_defaults = [r for r in default_routes if "utun" not in r]
+        if not utun_up:
+            leak_checks.append(
+                make_check(
+                    "killswitch_routes",
+                    "TUN 隧道与断流保护 (Kill-Switch) 风险",
+                    "FAIL",
+                    f"未检测到 utun 默认路由；路由={default_routes}",
+                    "当前流量未走虚拟网卡 TUN 接管，极易在未挂代理环境变量的客户端中直连。",
+                    "请在 Clash 中开启 Enhanced Mode / TUN 模式。",
+                )
             )
-        )
+        elif non_utun_defaults or scutil_info.get("scoped_private_dns"):
+            leak_checks.append(
+                make_check(
+                    "killswitch_routes",
+                    "TUN 隧道与断流保护 (Kill-Switch) 风险",
+                    "WARN",
+                    f"TUN 活跃 ({', '.join(utun_ips)})，但底层网卡仍有默认路由/私网 DNS",
+                    f"存在物理网卡默认路由 {non_utun_defaults} 及 Scoped DNS {scutil_info.get('scoped_private_dns')}。平时走 TUN 没问题，但系统休眠唤醒或 Clash 重载瞬间，后台客户端会立刻走物理网卡直连漏出真实 IP！",
+                    "休眠前先退出 Claude Desktop，或确保 Clash 开启严格的断网保护规则。",
+                )
+            )
+        else:
+            leak_checks.append(
+                make_check(
+                    "killswitch_routes",
+                    "TUN 隧道与断流保护 (Kill-Switch) 风险",
+                    "PASS",
+                    f"TUN 接管中 ({', '.join(utun_ips)})",
+                    "默认路由与 DNS 均由 TUN 接管。",
+                )
+            )
 
     claude_file_inventory = cat_residue.pop("inventory", []) if isinstance(cat_residue, dict) else []
 
     categories = {
-        "ip_reputation": {"title": "出口 IP 与多库 GeoIP 验真", "checks": ip_checks},
+        "ip_reputation": {"title": "出口 IP 与 11 大 GeoIP / 信誉库验真", "checks": ip_checks},
         "routing_leaks": {"title": "分流、DNS、IPv6、UDP/STUN 与断流检测", "checks": leak_checks},
         "clash_proxy": cat_clash,
-        "macos_system": cat_macos,
-        "claude_safari_residue": cat_residue,
+        "os_system": cat_os_sys,
+        "claude_residue": cat_residue,
     }
 
     counts = {"PASS": 0, "WARN": 0, "FAIL": 0, "INFO": 0}
@@ -3697,30 +4268,65 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
     high_fail = 0
     high_warn = 0
     low_warn = 0
+    deductions: List[Dict[str, Any]] = []
     for cat in categories.values():
+        cat_title = cat.get("title", "")
         for chk in cat["checks"]:
             st = chk["status"]
             sev = chk.get("severity", "low")
             if st in counts:
                 counts[st] += 1
             if st == "FAIL":
+                pts = 30 if sev == "critical" else 15
                 if sev == "critical":
                     critical_fail += 1
                 else:
                     high_fail += 1
+                deductions.append({
+                    "id": chk.get("id", ""),
+                    "category": cat_title,
+                    "title": chk.get("title", ""),
+                    "status": st,
+                    "severity": sev,
+                    "points": pts,
+                    "observed": chk.get("observed", ""),
+                })
             elif st == "WARN":
+                pts = 6 if sev == "high" else 2
                 if sev == "high":
                     high_warn += 1
                 else:
                     low_warn += 1
+                deductions.append({
+                    "id": chk.get("id", ""),
+                    "category": cat_title,
+                    "title": chk.get("title", ""),
+                    "status": st,
+                    "severity": sev,
+                    "points": pts,
+                    "observed": chk.get("observed", ""),
+                })
 
+    deductions.sort(key=lambda x: x["points"], reverse=True)
     penalty = critical_fail * 30 + high_fail * 15 + high_warn * 6 + low_warn * 2
     score = max(0, min(100, 100 - penalty))
+    if critical_fail > 0 or score < 50:
+        grade = "D"
+    elif score < 70 or counts["FAIL"] > 0:
+        grade = "C"
+    elif score < 85 or high_warn > 0:
+        grade = "B"
+    elif score < 95:
+        grade = "A"
+    else:
+        grade = "S"
     duration_ms = round((time.monotonic() - t0) * 1000.0, 1)
 
     return {
         "timestamp": now_iso(),
         "duration_ms": duration_ms,
+        "platform": PLATFORM_KEY,
+        "platform_label": PLATFORM_LABEL,
         "target": target_cfg,
         "targets_available": [{"code": k, "name": v["name"]} for k, v in TARGETS.items()],
         "egress_summary": egress_summary,
@@ -3732,6 +4338,9 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
         "counts": counts,
         "redline_count": critical_fail,
         "overall_score": score,
+        "grade": grade,
+        "total_penalty": penalty,
+        "deductions": deductions,
     }
 
 
@@ -3793,7 +4402,7 @@ def run_pulse(target_code: str, wake_detected: bool = False) -> Dict[str, Any]:
         target_code = "SG"
 
     trace = _trace_domain("claude.ai")
-    utun_up, utun_ips, _, _ = _check_utun_status()
+    utun_up, utun_ips, _, _ = _check_tun_cross_platform()
 
     ip = trace.get("ip", "")
     loc = trace.get("loc", "").upper()
@@ -3938,10 +4547,10 @@ _load_pulse_history()
 
 
 # ---------------------------------------------------------------------------
-# HTTP Server
+# HTTP Server (Strictly Read-Only Detection & Scoring)
 # ---------------------------------------------------------------------------
 class RegionGuardHandler(http.server.BaseHTTPRequestHandler):
-    server_version = "RegionGuard/1.1"
+    server_version = "RegionGuard/2.0"
 
     def log_message(self, format: str, *args: Any) -> None:
         return
@@ -4005,8 +4614,15 @@ class RegionGuardHandler(http.server.BaseHTTPRequestHandler):
                     "user_agent": self.headers.get("User-Agent", ""),
                     "sec_ch_ua": self.headers.get("Sec-CH-UA", ""),
                     "sec_ch_ua_platform": self.headers.get("Sec-CH-UA-Platform", ""),
+                    "sec_ch_ua_mobile": self.headers.get("Sec-CH-UA-Mobile", ""),
+                    "sec_ch_ua_arch": self.headers.get("Sec-CH-UA-Arch", ""),
+                    "sec_ch_ua_platform_version": self.headers.get("Sec-CH-UA-Platform-Version", ""),
+                    "sec_ch_ua_full_version_list": self.headers.get("Sec-CH-UA-Full-Version-List", ""),
                     "dnt": self.headers.get("DNT", ""),
                     "remote_addr": self.client_address[0],
+                    "platform": PLATFORM_KEY,
+                    "platform_label": PLATFORM_LABEL,
+                    "server_utc_ms": int(time.time() * 1000),
                 },
             )
         elif path == "/api/scan":
@@ -4066,13 +4682,25 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Region Guard local diagnostic web server")
     parser.add_argument("--host", default="127.0.0.1", help="Bind host (default 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8765, help="Bind port (default 8765)")
+    parser.add_argument("--open", action="store_true", help="Open dashboard in default browser after startup")
+    parser.add_argument("--no-open", action="store_true", help="Do not auto-open browser (for frozen exe)")
     args = parser.parse_args()
 
     if args.host not in {"127.0.0.1", "localhost", "::1"}:
         raise SystemExit("Security guard: server only binds to loopback (127.0.0.1)")
 
     srv = ThreadingHTTPServer((args.host, args.port), RegionGuardHandler)
-    print(f"Region Guard running at http://{args.host}:{args.port}", flush=True)
+    url = f"http://{args.host}:{args.port}"
+    print(f"Region Guard ({PLATFORM_LABEL}) running at {url}", flush=True)
+    should_open = args.open or (getattr(sys, "frozen", False) and not args.no_open)
+    if should_open:
+        def _open_tab() -> None:
+            try:
+                import webbrowser
+                webbrowser.open(url)
+            except Exception:
+                pass
+        threading.Timer(0.6, _open_tab).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

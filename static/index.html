@@ -13,16 +13,19 @@
       <div class="brand">
         <div class="brand-icon">RG</div>
         <div>
-          <h1>Region Guard · 地区与防风控全景监测台</h1>
-          <p class="subtitle">本机直采 10+ GeoIP / WHOIS / 全域名分流 / UDP STUN / macOS 系统指纹 / 浏览器 WebRTC 实测（纯只读 · 零密码/Cookie 明文）</p>
+          <div class="monitor-head-title">
+            <h1>Region Guard · 地区与防风控全景监测台</h1>
+            <span id="platformBadge" class="badge info">平台识别中...</span>
+          </div>
+          <p id="appSubtitle" class="subtitle">本机直采 11 大 GeoIP / WHOIS / 全域名分流 / Fake-IP / UDP STUN / 系统指纹 / 浏览器 WebRTC &amp; 语音字体实测（纯只读 · 零密码/Cookie 明文）</p>
         </div>
       </div>
       <div class="controls">
         <label class="select-wrap" for="targetSelect">
           <span>目标地区</span>
           <select id="targetSelect">
-            <option value="SG" selected>新加坡 (SG)</option>
-            <option value="US">美国 (US)</option>
+            <option value="US" selected>美国 (US)</option>
+            <option value="SG">新加坡 (SG)</option>
             <option value="JP">日本 (JP)</option>
             <option value="GB">英国 (GB)</option>
             <option value="TW">台湾 (TW)</option>
@@ -85,6 +88,36 @@
       </div>
     </section>
 
+    <!-- Score Breakdown (Read-Only Scoring Transparency) -->
+    <section class="card breakdown-card">
+      <div class="section-head compact">
+        <div>
+          <div class="monitor-head-title">
+            <h2>综合评分与扣分明细（纯只读检测 · 不修改系统/不清理文件）</h2>
+            <span id="gradeBadge" class="badge info">评级 --</span>
+          </div>
+          <p id="scoreFormulaText" class="section-sub">评分规则：满分 100 分，致命红线 -30/项 · 高危 FAIL -15/项 · 高风险 WARN -6/项 · 轻度 WARN -2/项（最低 0 分）</p>
+        </div>
+        <span id="deductionCountBadge" class="badge info">等待扫描...</span>
+      </div>
+      <div class="table-scroll breakdown-scroll">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>扣分</th>
+              <th>等级</th>
+              <th>所属维度</th>
+              <th>问题检测项</th>
+              <th>实测问题摘要</th>
+            </tr>
+          </thead>
+          <tbody id="deductionBody">
+            <tr><td colspan="5" class="empty-cell">等待扫描生成扣分明细...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
     <!-- Live Continuous Pulse Monitor -->
     <section class="card monitor-card">
       <div class="section-head">
@@ -140,8 +173,8 @@
       <div class="card">
         <div class="section-head compact">
           <div>
-            <h2>10 大 GeoIP 数据库交叉验证</h2>
-            <p class="section-sub">识别跨国广播段或不同风控库对同一 IP 的归属冲突</p>
+            <h2>11 大 GeoIP 与信誉库交叉验证</h2>
+            <p class="section-sub">识别跨国广播段、机房/滥用评分或不同风控库对同一 IP 的归属冲突</p>
           </div>
         </div>
         <div id="whoisSummaryBar" class="whois-bar">等待 WHOIS / BGP / rDNS 核验...</div>
@@ -197,7 +230,7 @@
       <div class="section-head compact">
         <div>
           <h2>Claude 本机生成文件与设备关联残留全景清单</h2>
-          <p class="section-sub">覆盖 Desktop 指纹文件（ant-did / Cookies / device_id_salt / config / 日志）、Claude Code CLI、全库钥匙串、~/Library 12 子目录、崩溃/临时/IDE 与 Safari WebsiteData / ITP / 历史（纯只读脱敏）</p>
+          <p id="inventorySubtitle" class="section-sub">覆盖 Desktop 指纹文件（含 Windows MSIX 容器与 ant-did / Cookies / device_id_salt / config / 日志）、Claude Code CLI、系统凭据/钥匙串、边缘缓存/IDE 与全浏览器站点存储（纯只读脱敏）</p>
         </div>
         <span id="inventoryBadge" class="badge info">等待扫描...</span>
       </div>
@@ -240,17 +273,19 @@
       <div class="section-head compact">
         <div>
           <h2>服务端与账号层人工自检清单（本机工具无法自动读取）</h2>
-          <p class="section-sub">以下 6 项属于 Anthropic / Stripe / OAuth 服务端或浏览器隔离信号，请逐项人工核对并勾选记录</p>
+          <p class="section-sub">以下 8 项属于 Anthropic / Stripe / OAuth 服务端、网络行为或浏览器隔离信号，请逐项人工核对并勾选记录</p>
         </div>
-        <span id="checklistProgress" class="badge info">0 / 6 已确认</span>
+        <span id="checklistProgress" class="badge info">0 / 8 已确认</span>
       </div>
       <div id="manualChecklist" class="checklist-list">
         <label class="checklist-item"><input type="checkbox" data-check="fresh_account" /><span>使用未曾被 <code class="mono">account_banned</code> 或 <code class="mono">region_blocked</code> 标记过的全新账号</span></label>
-        <label class="checklist-item"><input type="checkbox" data-check="safari_profile" /><span>已清理 Safari Manage Website Data（claude / anthropic / hcaptcha / stripe），或已为新号新建独立的 Safari Profile（全新 Cookies / WebsiteData / DeviceIdHashSalts）</span></label>
+        <label class="checklist-item"><input type="checkbox" data-check="safari_profile" /><span id="chkProfileText">已清理浏览器站点数据（claude / anthropic / hcaptcha / stripe / stripe.network），或已为新号新建完全独立的浏览器 Profile</span></label>
         <label class="checklist-item"><input type="checkbox" data-check="oauth_region" /><span>登录用的 Google / Apple OAuth 账号历史地区在支持区内（非刚改区或国内主力号）</span></label>
-        <label class="checklist-item"><input type="checkbox" data-check="card_bin" /><span>支付卡发卡行国家（BIN）与账单地址在支持区，且与节点所属国家一致</span></label>
+        <label class="checklist-item"><input type="checkbox" data-check="card_bin" /><span>支付卡发卡行国家（BIN）、账单地址与节点国家一致，且支持原生 3DS 验证（避免高危虚拟卡段）</span></label>
         <label class="checklist-item"><input type="checkbox" data-check="phone_sms" /><span>手机号验证区号为支持地区，且非高风控虚拟号段（VoIP / 公开接码平台）</span></label>
-        <label class="checklist-item"><input type="checkbox" data-check="reboot_abc" /><span>系统级修改（Country / 主机名 / 时区 / Power Nap / 定位）完成后已完整重启 Mac，并切到 ABC 英文键盘再登录</span></label>
+        <label class="checklist-item"><input type="checkbox" data-check="no_oauth_harness" /><span>绝不在第三方中转站、多号池或未授权套壳客户端中复用 Claude Pro/Max 订阅 OAuth 凭据（官方 2025-2026 高频封号红线）</span></label>
+        <label class="checklist-item"><input type="checkbox" data-check="static_single_region" /><span>长期固定同一国家与静态干净节点（严禁早美晚日跨国频切引发 Impossible Travel），并已关闭 Claude 开机自启</span></label>
+        <label class="checklist-item"><input type="checkbox" data-check="reboot_abc" /><span id="chkRebootText">系统级修改（地区 / 计算机名 / 时区 / 休眠 / 定位）完成后已完整重启系统，并切到英文键盘再登录</span></label>
       </div>
     </section>
   </div>
