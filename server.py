@@ -29,6 +29,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
+import zlib
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
 IS_WINDOWS = sys.platform == "win32"
@@ -130,6 +131,8 @@ CLAUDE_RISK_DOMAINS = (
     "claude.ai",
     "claude.com",
     "anthropic.com",
+    "claudeusercontent.com",
+    "claudemcpcontent.com",
     "hcaptcha.com",
     "stripe.com",
     "stripe.network",
@@ -956,7 +959,13 @@ def _check_split_dns_resolution() -> Dict[str, Any]:
     domains = [
         "claude.ai",
         "api.anthropic.com",
+        "downloads.claude.ai",
+        "releases.claude.com",
+        "assets.claude.ai",
+        "www.claudeusercontent.com",
+        "sandbox.claudemcpcontent.com",
         "statsig.anthropic.com",
+        "o1158394.ingest.us.sentry.io",
         "m.stripe.network",
         "api.stripe.com",
         "api.hcaptcha.com",
@@ -1137,8 +1146,12 @@ def _safe_parse_clash_yaml(path: str) -> Dict[str, Any]:
         "tun_enable": None,
         "tun_stack": "",
         "tun_strict_route": None,
+        "tun_auto_route": None,
+        "tun_auto_detect_interface": None,
         "fakeip_risk_filters": [],
         "direct_risk_rules": [],
+        "process_direct_risks": [],
+        "reject_risk_rules": [],
         "proxy_groups": [],
         "direct_listeners": [],
         "prepend_direct_count": 0,
@@ -1152,7 +1165,19 @@ def _safe_parse_clash_yaml(path: str) -> Dict[str, Any]:
     except Exception:
         return result
 
-    risk_rule_kw = ("claude", "anthropic", "stripe", "hcaptcha", "cloudflare", "statsig", "sentry", "datadog")
+    risk_rule_kw = (
+        "claude",
+        "anthropic",
+        "claudeusercontent",
+        "claudemcpcontent",
+        "stripe",
+        "hcaptcha",
+        "cloudflare",
+        "statsig",
+        "sentry",
+        "datadog",
+    )
+    proc_sub_kw = ("claude", "cowork", "anthropic", "node", "ssh", "git", "curl")
     top_sec = ""
     sub_sec = ""
     base_indent = -1
@@ -1219,11 +1244,23 @@ def _safe_parse_clash_yaml(path: str) -> Dict[str, Any]:
                     result["tun_stack"] = val
                 elif k == "strict-route" and val:
                     result["tun_strict_route"] = val.lower() == "true"
+                elif k == "auto-route" and val:
+                    result["tun_auto_route"] = val.lower() == "true"
+                elif k == "auto-detect-interface" and val:
+                    result["tun_auto_detect_interface"] = val.lower() == "true"
         elif top_sec == "rules":
-            if s.startswith("-") and "direct" in low and any(kw in low for kw in risk_rule_kw):
+            if s.startswith("-"):
                 val = s[1:].strip().strip('"').strip("'")
-                if len(result["direct_risk_rules"]) < 8:
-                    result["direct_risk_rules"].append(val[:72])
+                if "direct" in low:
+                    if low.lstrip("- ").startswith(("process-name,", "process-path,")) and any(pk in low for pk in proc_sub_kw):
+                        if len(result["process_direct_risks"]) < 8:
+                            result["process_direct_risks"].append(val[:72])
+                    elif any(kw in low for kw in risk_rule_kw):
+                        if len(result["direct_risk_rules"]) < 8:
+                            result["direct_risk_rules"].append(val[:72])
+                elif "reject" in low and any(kw in low for kw in risk_rule_kw):
+                    if len(result["reject_risk_rules"]) < 8:
+                        result["reject_risk_rules"].append(val[:72])
         elif top_sec == "proxy-groups":
             if s.startswith("- name:") or s.startswith("name:"):
                 val = s.split(":", 1)[1].strip().strip('"').strip("'")
@@ -1336,6 +1373,8 @@ def audit_clash_proxy() -> Dict[str, Any]:
 
         direct_risk_rules = parsed.get("direct_risk_rules") or []
         fakeip_risk_filters = parsed.get("fakeip_risk_filters") or []
+        proc_direct_risks = parsed.get("process_direct_risks") or []
+        reject_risk_rules = parsed.get("reject_risk_rules") or []
         if direct_risk_rules or fakeip_risk_filters:
             checks.append(
                 make_check(
@@ -1343,9 +1382,44 @@ def audit_clash_proxy() -> Dict[str, Any]:
                     "Clash 规则与 Fake-IP 放行冲突",
                     "FAIL",
                     f"DIRECT 命中 {len(direct_risk_rules)} 条 | fake-ip-filter 命中 {len(fakeip_risk_filters)} 条",
-                    f"检测到放行 Claude/风控域名的规则: {', '.join((direct_risk_rules + fakeip_risk_filters)[:5])}",
-                    "移除 anthropic / claude / stripe / hcaptcha / statsig / cloudflare 相关的 DIRECT 或 fake-ip-filter 条目。",
+                    f"检测到放行 Claude/风控/遥测域名的规则: {', '.join((direct_risk_rules + fakeip_risk_filters)[:5])}",
+                    "移除 anthropic / claude / claudeusercontent / stripe / hcaptcha / statsig / sentry / datadog / cloudflare 相关的 DIRECT 或 fake-ip-filter 条目。",
                     severity="critical",
+                )
+            )
+        if proc_direct_risks:
+            is_claude_proc_direct = any(
+                any(k in r.lower() for k in ("claude", "cowork", "anthropic")) for r in proc_direct_risks
+            )
+            checks.append(
+                make_check(
+                    "clash_process_direct",
+                    "Clash 进程级直连规则误伤检测 (PROCESS-NAME)",
+                    "FAIL" if is_claude_proc_direct else "WARN",
+                    f"命中 {len(proc_direct_risks)} 条进程直连规则: {', '.join(proc_direct_risks[:4])}",
+                    "Claude Desktop 会拉起 Cowork VM、SSH Proxy、内置 Node 与 Git 子进程；将这些进程设为 DIRECT 会导致后台请求绕过代理直连本地宽带！",
+                    "从 Clash rules 中移除针对 claude / cowork / node / ssh / git / curl 的 PROCESS-NAME DIRECT 规则。",
+                    severity="critical" if is_claude_proc_direct else "high",
+                )
+            )
+        if reject_risk_rules:
+            crit_reject = [
+                r for r in reject_risk_rules
+                if any(k in r.lower() for k in ("claude", "anthropic", "stripe", "hcaptcha", "cloudflare", "statsig"))
+            ]
+            checks.append(
+                make_check(
+                    "clash_reject_telemetry",
+                    "Clash 风控/遥测域名 REJECT 拦截副作用检测",
+                    "FAIL" if crit_reject else "WARN",
+                    f"命中 {len(reject_risk_rules)} 条 REJECT 规则: {', '.join(reject_risk_rules[:4])}",
+                    (
+                        "致命误伤！拦截 claude / anthropic / stripe / hcaptcha / statsig 会直接破坏验证或支付！"
+                        if crit_reject
+                        else "对 Sentry / Datadog 遥测域名使用 REJECT 会导致客户端在 sentry/queue 积压离线包并累加 desktop_telemetry_upload_lost 失败上报计数，且拦不住第一方 claude.ai/api/v2/rum。"
+                    ),
+                    "切勿用 REJECT 硬拦相关域名；应统一走与 claude.ai 相同的代理出口，并改用官方环境变量（DISABLE_TELEMETRY=1 等）合规关闭非必要遥测。",
+                    severity="critical" if crit_reject else "low",
                 )
             )
 
@@ -1839,8 +1913,10 @@ def audit_macos_system(target_cfg: Dict[str, Any]) -> Dict[str, Any]:
         )
     )
 
-    # 11. /etc/hosts custom overrides
+    # 11. /etc/hosts custom overrides & telemetry blackhole side-effect check
     custom_hosts: List[str] = []
+    risky_hosts: List[str] = []
+    telemetry_blackhole_hosts: List[str] = []
     try:
         with open("/etc/hosts", "r", encoding="utf-8", errors="replace") as f:
             for line in f:
@@ -1848,23 +1924,45 @@ def audit_macos_system(target_cfg: Dict[str, Any]) -> Dict[str, Any]:
                 if not s or s.startswith("#"):
                     continue
                 parts = s.split()
-                if len(parts) >= 2 and parts[1] not in {"localhost", "broadcasthost"}:
+                if len(parts) >= 2 and parts[1].lower() not in {"localhost", "broadcasthost"}:
                     custom_hosts.append(s[:80])
+                    low_s = s.lower()
+                    if any(k in low_s for k in ("claude", "anthropic", "claudeusercontent", "claudemcpcontent", "stripe", "hcaptcha", "cloudflare", "statsig")):
+                        risky_hosts.append(s[:80])
+                    elif any(k in low_s for k in ("sentry.io", "datadoghq.")):
+                        telemetry_blackhole_hosts.append(s[:80])
     except Exception:
         pass
-    if custom_hosts:
+    if risky_hosts or telemetry_blackhole_hosts or custom_hosts:
         checks.append(
             make_check(
                 "etc_hosts",
-                "/etc/hosts 自定义域名劫持检测",
-                "WARN",
-                f"发现 {len(custom_hosts)} 条自定义条目",
-                f"条目: {'; '.join(custom_hosts[:5])}",
-                "确认其中不包含 claude / anthropic / stripe / cloudflare 的陈旧绑定。",
+                "/etc/hosts 域名劫持与遥测黑洞副作用检测",
+                "FAIL" if risky_hosts else "WARN",
+                (
+                    f"命中核心风险域名 {len(risky_hosts)} 条"
+                    if risky_hosts
+                    else (
+                        f"命中 Sentry/Datadog 黑洞绑定 {len(telemetry_blackhole_hosts)} 条"
+                        if telemetry_blackhole_hosts
+                        else f"发现 {len(custom_hosts)} 条自定义条目"
+                    )
+                ),
+                (
+                    f"核心风险条目: {'; '.join(risky_hosts[:4])}"
+                    if risky_hosts
+                    else (
+                        f"遥测黑洞条目: {'; '.join(telemetry_blackhole_hosts[:4])}。用 hosts 屏蔽 Sentry/Datadog 会导致离线队列积压并触发失败计数上报，建议移除黑洞绑定并改走统一代理出口。"
+                        if telemetry_blackhole_hosts
+                        else f"条目: {'; '.join(custom_hosts[:5])}"
+                    )
+                ),
+                "立即清理 /etc/hosts 中关于 claude / anthropic / stripe / hcaptcha / cloudflare 的绑定！" if risky_hosts else "确认其中不包含陈旧劫持或对 sentry.io / datadoghq 的硬屏蔽。",
+                severity="high" if risky_hosts else "low",
             )
         )
     else:
-        checks.append(make_check("etc_hosts", "/etc/hosts 自定义域名劫持检测", "PASS", "仅默认 localhost 条目", "未发现自定义 hosts 劫持。"))
+        checks.append(make_check("etc_hosts", "/etc/hosts 域名劫持与遥测黑洞副作用检测", "PASS", "仅默认 localhost 条目", "未发现自定义 hosts 劫持或遥测黑洞绑定。"))
 
     # 12. Installed Apps Awareness (Remote control / proxy / CN apps)
     try:
@@ -2180,6 +2278,70 @@ def audit_macos_system(target_cfg: Dict[str, Any]) -> Dict[str, Any]:
     else:
         checks.append(make_check("git_identity_leak", "Git 全局身份配置 (Claude Code CLI 上下文)", "PASS", "未发现国内邮箱后缀或中文 Git 用户名", "全局 ~/.gitconfig 无明显国内邮箱域名或中文用户名特征。"))
 
+    # 21. Official Claude Telemetry Opt-Out & MDM Policy Status (Read-Only)
+    mac_tele_flags: List[str] = []
+    for tk in ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "DISABLE_TELEMETRY", "DO_NOT_TRACK"):
+        tv = os.environ.get(tk, "").strip()
+        if not tv:
+            rc_tl, out_tl, _ = run_cmd(["/bin/launchctl", "getenv", tk], timeout=2)
+            if rc_tl == 0 and out_tl.strip():
+                tv = out_tl.strip()
+        if tv and tv.lower() not in {"0", "false", "no", "off"}:
+            mac_tele_flags.append(f"env:{tk}={tv}")
+    cc_set_p = os.path.expanduser("~/.claude/settings.json")
+    if os.path.isfile(cc_set_p):
+        try:
+            cc_sd = json.load(open(cc_set_p, "r", encoding="utf-8"))
+            cc_senv = cc_sd.get("env") if isinstance(cc_sd.get("env"), dict) else {}
+            for tk in ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "DISABLE_TELEMETRY", "DO_NOT_TRACK"):
+                tv = str(cc_senv.get(tk, "") or "").strip()
+                if tv and tv.lower() not in {"0", "false", "no", "off"}:
+                    tag = f"settings.json:{tk}={tv}"
+                    if tag not in mac_tele_flags:
+                        mac_tele_flags.append(tag)
+        except Exception:
+            pass
+    mdm_plist = "/Library/Managed Preferences/com.anthropic.claudefordesktop.plist"
+    mdm_flags: List[str] = []
+    if os.path.isfile(mdm_plist):
+        try:
+            with open(mdm_plist, "rb") as mf:
+                mdm_d = plistlib.load(mf)
+            for pk in ("disableNonessentialTelemetry", "disableEssentialTelemetry", "disableNonessentialServices"):
+                if mdm_d.get(pk) is True:
+                    mdm_flags.append(f"MDM:{pk}=true")
+        except Exception:
+            pass
+    mac_tele_cmd = (
+        "launchctl setenv CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC 1 && "
+        "launchctl setenv DISABLE_TELEMETRY 1 && "
+        "launchctl setenv DO_NOT_TRACK 1"
+    )
+    if mac_tele_flags:
+        obs_mtp = ", ".join(mac_tele_flags) + (f" | MDM(仅3P生效): {', '.join(mdm_flags)}" if mdm_flags else "")
+        checks.append(
+            make_check(
+                "claude_telemetry_privacy",
+                "Claude 官方遥测隐私开关状态 (CLI / 子进程 / MDM)",
+                "PASS",
+                obs_mtp,
+                "已启用官方支持的环境变量遥测抑制（对 Claude Code CLI 及桌面端内置子进程生效，合规关闭非必要 OTel 与事件上报）。注：MDM Profile 遥测开关仅对 3P 企业部署生效。",
+            )
+        )
+    else:
+        obs_mtp = "未配置官方遥测抑制环境变量 (默认全量上报)" + (f" | MDM(仅3P生效): {', '.join(mdm_flags)}" if mdm_flags else "")
+        checks.append(
+            make_check(
+                "claude_telemetry_privacy",
+                "Claude 官方遥测隐私开关状态 (CLI / 子进程 / MDM)",
+                "INFO",
+                obs_mtp,
+                "Claude Code 与桌面端内置子进程原生支持 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1、DISABLE_TELEMETRY=1 与 DO_NOT_TRACK=1 官方环境变量合规关闭非必要遥测（避免用 hosts/REJECT 粗暴拦截引发离线队列积压）。",
+                "可选：执行下方命令或在 ~/.zshrc / ~/.claude/settings.json 中开启官方遥测抑制。",
+                mac_tele_cmd,
+            )
+        )
+
     return {"title": "macOS 系统环境与指纹", "checks": checks}
 
 
@@ -2345,6 +2507,93 @@ def _scan_safari_claude_storage() -> Dict[str, Any]:
     return res
 
 
+def _inspect_desktop_telemetry_artifacts_posix(cdir: str) -> Dict[str, Any]:
+    """Read-only & redacted deep audit of sentry/scope_v3.json, sentry/queue & GrowthBook fcache."""
+    out: Dict[str, Any] = {
+        "sentry_notes": [],
+        "sentry_status": "PASS",
+        "sentry_critical": False,
+        "fcache_notes": [],
+        "fcache_status": "PASS",
+    }
+    scope_path = os.path.join(cdir, "sentry", "scope_v3.json")
+    if os.path.isfile(scope_path):
+        out["sentry_status"] = "WARN"
+        try:
+            with open(scope_path, "r", encoding="utf-8", errors="replace") as f:
+                sc = json.load(f)
+            ev = sc.get("event") if isinstance(sc.get("event"), dict) else {}
+            ctxs = ev.get("contexts") if isinstance(ev.get("contexts"), dict) else {}
+            culture = ctxs.get("culture") if isinstance(ctxs.get("culture"), dict) else {}
+            scope_blk = sc.get("scope") if isinstance(sc.get("scope"), dict) else {}
+            has_uid = bool((scope_blk.get("user") or {}).get("id")) if isinstance(scope_blk.get("user"), dict) else False
+            loc = str(culture.get("locale") or "").strip()
+            tz = str(culture.get("timezone") or "").strip()
+            parts = []
+            if loc or tz:
+                parts.append(f"culture={loc or '-'}/{tz or '-'}")
+            if has_uid:
+                parts.append("含设备UUID绑定(已脱敏)")
+            is_bad_tz = tz in RESTRICTED_TIMEZONES
+            is_bad_loc = loc.lower().startswith(("zh-cn", "zh_cn", "zh-hans"))
+            if is_bad_tz or is_bad_loc:
+                out["sentry_status"] = "FAIL"
+                out["sentry_critical"] = is_bad_tz
+                parts.append("暴露受限区时区/简中环境!")
+            elif has_uid:
+                out["sentry_status"] = "FAIL"
+            out["sentry_notes"].append(f"sentry/scope_v3.json({', '.join(parts) or '存在'})")
+        except Exception:
+            out["sentry_notes"].append("sentry/scope_v3.json(存在)")
+
+    q_dir = os.path.join(cdir, "sentry", "queue")
+    if os.path.isdir(q_dir):
+        q_envelopes = 0
+        try:
+            for fn in os.listdir(q_dir):
+                fp = os.path.join(q_dir, fn)
+                if fn == "queue-v2.json" and os.path.isfile(fp):
+                    try:
+                        q_arr = json.load(open(fp, "r", encoding="utf-8", errors="replace"))
+                        if isinstance(q_arr, list):
+                            q_envelopes = max(q_envelopes, len(q_arr))
+                    except Exception:
+                        pass
+                elif os.path.isfile(fp) and os.path.getsize(fp) > 2:
+                    q_envelopes += 1
+        except Exception:
+            pass
+        if q_envelopes > 0:
+            out["sentry_notes"].append(f"sentry/queue(积压 {q_envelopes} 个待补发离线包!)")
+            if out["sentry_status"] == "PASS":
+                out["sentry_status"] = "WARN"
+
+    fcache_path = os.path.join(cdir, "fcache")
+    if os.path.isfile(fcache_path):
+        out["fcache_status"] = "WARN"
+        try:
+            with open(fcache_path, "rb") as ff:
+                raw = ff.read(2 * 1024 * 1024)
+            gz_idx = raw.find(b"\x1f\x8b\x08", 0, 32) if raw[:3] == b"CLF" else -1
+            if gz_idx != -1:
+                dec = zlib.decompress(raw[gz_idx:], 16 + zlib.MAX_WBITS)
+                fc_obj = json.loads(dec.decode("utf-8", errors="replace"))
+                has_org = bool(fc_obj.get("orgUuid"))
+                mode = str(fc_obj.get("mode") or "-")
+                fcnt = len(fc_obj.get("features") or {}) if isinstance(fc_obj.get("features"), dict) else 0
+                f_parts = [f"mode={mode}", f"features={fcnt}"]
+                if has_org:
+                    f_parts.append("含旧orgUuid(已脱敏)")
+                    out["fcache_status"] = "FAIL"
+                out["fcache_notes"].append(f"fcache({', '.join(f_parts)})")
+            else:
+                out["fcache_notes"].append(f"fcache({len(raw)}B)")
+        except Exception:
+            out["fcache_notes"].append("fcache(存在)")
+
+    return out
+
+
 def audit_claude_safari_residue() -> Dict[str, Any]:
     checks: List[Dict[str, str]] = []
     inventory: List[Dict[str, str]] = []
@@ -2361,16 +2610,27 @@ def audit_claude_safari_residue() -> Dict[str, Any]:
             }
         )
 
-    # 1. Installed Claude App / CLI binaries & Running processes
+    # 1. Installed Claude App / CLI binaries & Running processes (including Cowork VM & SSH/MCP helpers)
     _, ps_c_out, _ = run_cmd(["/bin/ps", "-axo", "pid,comm"], timeout=3)
     running_claude: List[str] = []
+    helper_names = {
+        "claude",
+        "claude helper",
+        "claude-code",
+        "cowork",
+        "cowork-svc",
+        "claude-ssh-broker",
+        "claude-ssh-proxy",
+        "chrome-native-host",
+        "github-mcp-server",
+    }
     for line in ps_c_out.splitlines()[1:]:
         parts = line.strip().split(None, 1)
         if len(parts) != 2:
             continue
         pid_s, comm = parts
         base = os.path.basename(comm).lower()
-        if "/applications/claude.app/" in comm.lower() or base in {"claude", "claude helper", "claude-code"}:
+        if "/applications/claude.app/" in comm.lower() or base in helper_names:
             running_claude.append(f"{pid_s} {base}")
 
     installed_apps = [p for p in ["/Applications/Claude.app", os.path.expanduser("~/Applications/Claude.app")] if os.path.exists(p)]
@@ -2463,6 +2723,35 @@ def audit_claude_safari_residue() -> Dict[str, Any]:
         desktop_status = "FAIL"
     else:
         add_inv("Claude Desktop", "ant-did 设备唯一 ID", "~/Library/Application Support/Claude/ant-did", "Anthropic 跨账号关联核心设备指纹文件", "已清理 (0 残留)", "PASS")
+
+    tele_mac = _inspect_desktop_telemetry_artifacts_posix(claude_dir)
+    if tele_mac["sentry_notes"]:
+        desktop_details.extend(tele_mac["sentry_notes"])
+        if tele_mac["sentry_status"] == "FAIL":
+            desktop_status = "FAIL"
+            desktop_sev = "critical" if tele_mac["sentry_critical"] else "high"
+    add_inv(
+        "Claude Desktop",
+        "Sentry 启动环境快照与离线队列",
+        "~/Library/Application Support/Claude/sentry/{scope_v3.json, queue}",
+        "启动瞬间（未登录前）即落盘记录 culture(locale/timezone 如 zh-CN/Asia/Shanghai) 与设备 UUID",
+        "；".join(tele_mac["sentry_notes"]) if tele_mac["sentry_notes"] else "已清理 (0 残留)",
+        tele_mac["sentry_status"],
+    )
+    if tele_mac["fcache_notes"]:
+        desktop_details.extend(tele_mac["fcache_notes"])
+        if tele_mac["fcache_status"] == "FAIL":
+            desktop_status = "FAIL"
+            if desktop_sev != "critical":
+                desktop_sev = "high"
+    add_inv(
+        "Claude Desktop",
+        "GrowthBook 实验与组织缓存 (fcache)",
+        "~/Library/Application Support/Claude/fcache",
+        "CLF+Gzip 压缩存储旧账号 orgUuid 与实验开关（24h 缓存）",
+        "；".join(tele_mac["fcache_notes"]) if tele_mac["fcache_notes"] else "已清理 (0 残留)",
+        tele_mac["fcache_status"],
+    )
 
     if os.path.isfile(cookies_db):
         tmp = tempfile.mktemp(suffix=".db")
@@ -2619,6 +2908,8 @@ def audit_claude_safari_residue() -> Dict[str, Any]:
     if os.path.isdir(log_dir):
         rb_cnt = 0
         ban_cnt = 0
+        evict_cnt = 0
+        tele_err_cnt = 0
         stripe_cnt = 0
         net_cnt = 0
         log_files = [fn for fn in os.listdir(log_dir) if fn.endswith(".log") and os.path.isfile(os.path.join(log_dir, fn))]
@@ -2626,13 +2917,18 @@ def audit_claude_safari_residue() -> Dict[str, Any]:
             try:
                 txt = open(os.path.join(log_dir, fn), "r", encoding="utf-8", errors="replace").read()
                 rb_cnt += txt.count("region_blocked") + txt.count("isn't available in your region")
-                ban_cnt += txt.count("account_banned")
+                ban_cnt += txt.count("account_banned") + txt.count("bad_device_id")
+                evict_cnt += txt.count("Claude-Login-Ended-By") + txt.count("login_limit_reached")
+                tele_err_cnt += txt.count("[EventLogging] Batch flush FAILED")
                 stripe_cnt += txt.count("Failed to load Stripe.js")
                 net_cnt += txt.count("ERR_NETWORK_CHANGED")
             except Exception:
                 pass
-        log_obs = f"{len(log_files)} 个日志 (region_blocked={rb_cnt}, account_banned={ban_cnt}, Stripe失败={stripe_cnt}, 网络变化={net_cnt})"
-        if ban_cnt or rb_cnt:
+        log_obs = (
+            f"{len(log_files)} 个日志 (region_blocked={rb_cnt}, banned/bad_did={ban_cnt}, "
+            f"踢号={evict_cnt}, 遥测拒签={tele_err_cnt}, Stripe失败={stripe_cnt}, 网络变化={net_cnt})"
+        )
+        if ban_cnt or rb_cnt or evict_cnt:
             log_st = "FAIL"
             desktop_status = "FAIL"
             desktop_sev = "high"
@@ -3348,6 +3644,8 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
         "console.anthropic.com",
         "platform.claude.com",
         "code.claude.com",
+        "releases.claude.com",
+        "sandbox.claudemcpcontent.com",
         "challenges.cloudflare.com",
     ]
 
@@ -3376,9 +3674,12 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
             ("hCaptcha Assets", "https://newassets.hcaptcha.com/", "critical"),
             ("CF Turnstile", "https://challenges.cloudflare.com/turnstile/v0/api.js", "critical"),
             ("Anthropic Statsig", "https://statsig.anthropic.com/", "critical"),
+            ("Claude Model Catalog", "https://downloads.claude.ai/model-catalog/v1/catalog.json", "critical"),
             ("Claude Portal", "https://claude.com/", "critical"),
             ("Google OAuth", "https://accounts.google.com/Generate204", "critical"),
             ("Apple OAuth", "https://appleid.apple.com/", "critical"),
+            ("Claude Artifact Sandbox", "https://www.claudeusercontent.com/", "telemetry"),
+            ("Claude MCP Proxy", "https://mcp-proxy.anthropic.com/", "telemetry"),
             ("Datadog RUM", "https://browser-intake-us5-datadoghq.com/", "telemetry"),
             ("Sentry", "https://o1158394.ingest.us.sentry.io/", "telemetry"),
             ("Intercom", "https://widget.intercom.io/", "telemetry"),
@@ -3948,24 +4249,30 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
             )
         )
     elif not fakeip_doms and not realip_doms:
+        total_dns_doms = len(split_dns_res.get("resolved") or {}) or 13
         leak_checks.append(
             make_check(
                 "split_dns_divergence",
                 "风控关键域名本地 DNS 污染与 Fake-IP 分叉检测",
                 "WARN",
-                "本地 DNS 解析全部失败 (0/7)",
-                "无法通过系统 DNS 解析 claude.ai / stripe.network / statsig.anthropic.com，请检查本机 DNS 或代理状态。",
+                f"本地 DNS 解析全部失败 (0/{total_dns_doms})",
+                "无法通过系统 DNS 解析 claude.ai / downloads.claude.ai / stripe.network / statsig.anthropic.com，请检查本机 DNS 或代理状态。",
             )
         )
     else:
-        mode_tag = f"全部统一 Fake-IP ({len(fakeip_doms)}/7)" if fakeip_doms else f"全部统一真实解析 ({len(realip_doms)}/7)"
+        total_dns_doms = len(split_dns_res.get("resolved") or {}) or 13
+        mode_tag = (
+            f"全部统一 Fake-IP ({len(fakeip_doms)}/{total_dns_doms})"
+            if fakeip_doms
+            else f"全部统一真实解析 ({len(realip_doms)}/{total_dns_doms})"
+        )
         leak_checks.append(
             make_check(
                 "split_dns_divergence",
                 "风控关键域名本地 DNS 污染与 Fake-IP 分叉检测",
                 "PASS",
                 mode_tag,
-                "claude.ai、api.anthropic.com、statsig.anthropic.com、m.stripe.network、api.stripe.com、api.hcaptcha.com、challenges.cloudflare.com 解析模式一致且无 DNS 劫持。",
+                "claude.ai、api.anthropic.com、downloads.claude.ai、releases.claude.com、claudeusercontent.com、sentry.io、m.stripe.network 等全部域名解析模式一致且无 DNS 劫持。",
             )
         )
 

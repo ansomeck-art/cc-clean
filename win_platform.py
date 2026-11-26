@@ -20,6 +20,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import zlib
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 if sys.platform == "win32":
@@ -164,6 +165,8 @@ CLAUDE_RISK_DOMAINS = (
     "claude.ai",
     "claude.com",
     "anthropic.com",
+    "claudeusercontent.com",
+    "claudemcpcontent.com",
     "hcaptcha.com",
     "stripe.com",
     "stripe.network",
@@ -753,7 +756,21 @@ def win_check_dns_and_proxy(tun_details: Optional[Dict[str, Any]] = None) -> Dic
             tl = tok.strip().lower().lstrip("*.")
             if not tl:
                 continue
-            if any(k in tl for k in ("claude", "anthropic", "stripe", "hcaptcha", "cloudflare", "statsig")):
+            if any(
+                k in tl
+                for k in (
+                    "claude",
+                    "anthropic",
+                    "claudeusercontent",
+                    "claudemcpcontent",
+                    "stripe",
+                    "hcaptcha",
+                    "cloudflare",
+                    "statsig",
+                    "sentry",
+                    "datadog",
+                )
+            ):
                 bypass_risk.append(tok.strip())
 
     # WinHTTP proxy check (best-effort; some minimal Windows editions omit winhttp netsh helper)
@@ -948,11 +965,15 @@ def win_audit_clash_proxy(
             )
         )
 
-        # Check TUN config & direct risk rules
+        # Check TUN config, direct risk rules, PROCESS-NAME direct leaks & REJECT side-effects
         tun_en = parsed.get("tun_enable")
         strict_rt = parsed.get("tun_strict_route")
+        auto_rt = parsed.get("tun_auto_route")
+        auto_det = parsed.get("tun_auto_detect_interface")
         direct_risk_rules = parsed.get("direct_risk_rules") or []
         fakeip_risk_filters = parsed.get("fakeip_risk_filters") or []
+        proc_direct_risks = parsed.get("process_direct_risks") or []
+        reject_risk_rules = parsed.get("reject_risk_rules") or []
         if direct_risk_rules or fakeip_risk_filters:
             checks.append(
                 _make_check(
@@ -960,26 +981,66 @@ def win_audit_clash_proxy(
                     f"{client_label} 规则与 Fake-IP 放行冲突",
                     "FAIL",
                     f"DIRECT 命中 {len(direct_risk_rules)} 条 | fake-ip-filter 命中 {len(fakeip_risk_filters)} 条",
-                    f"检测到可能放行 Claude/风控域名的配置: {', '.join((direct_risk_rules + fakeip_risk_filters)[:5])}",
-                    "从 DIRECT 规则和 fake-ip-filter 中移除 anthropic / claude / stripe / hcaptcha / statsig / cloudflare 相关条目。",
+                    f"检测到可能放行 Claude/风控/遥测域名的配置: {', '.join((direct_risk_rules + fakeip_risk_filters)[:5])}",
+                    "从 DIRECT 规则和 fake-ip-filter 中移除 anthropic / claude / claudeusercontent / stripe / hcaptcha / statsig / sentry / datadog / cloudflare 相关条目。",
                     severity="critical",
                 )
             )
         elif tun_en is not None:
-            tun_note = f"tun.enable={tun_en}, stack={parsed.get('tun_stack') or '-'}, strict-route={strict_rt}"
-            if tun_en and strict_rt is False:
+            tun_note = (
+                f"tun.enable={tun_en}, stack={parsed.get('tun_stack') or '-'}, "
+                f"auto-route={auto_rt}, strict-route={strict_rt}, auto-detect={auto_det}"
+            )
+            if tun_en and (strict_rt is False or auto_rt is False):
                 checks.append(
                     _make_check(
                         "clash_tun_cfg",
                         f"{client_label} TUN 严格路由配置",
                         "WARN",
                         tun_note,
-                        "已启用 TUN 但 strict-route=false，部分系统连接可能绕过 TUN 直连物理网卡。",
-                        "在 TUN 设置中开启 strict-route: true 与 auto-route: true。",
+                        "已启用 TUN 但 strict-route 或 auto-route 为 false，Claude 子进程（cowork-svc.exe / 内置 CLI / SSH）及虚拟网卡流量可能绕过 TUN 直连物理网卡。",
+                        "在 TUN 设置中同时开启 auto-route: true、strict-route: true 与 auto-detect-interface: true。",
                     )
                 )
             else:
                 checks.append(_make_check("clash_tun_cfg", f"{client_label} TUN 严格路由配置", "PASS" if tun_en else "INFO", tun_note, "Clash TUN 配置已核查。"))
+
+        if proc_direct_risks:
+            is_claude_proc_direct = any(
+                any(k in r.lower() for k in ("claude", "cowork", "anthropic")) for r in proc_direct_risks
+            )
+            checks.append(
+                _make_check(
+                    "clash_process_direct",
+                    f"{client_label} 进程级直连规则误伤检测 (PROCESS-NAME)",
+                    "FAIL" if is_claude_proc_direct else "WARN",
+                    f"命中 {len(proc_direct_risks)} 条进程直连规则: {', '.join(proc_direct_risks[:4])}",
+                    "Claude Desktop 内部会拉起 cowork-svc.exe、claude-ssh-proxy.exe、node、git 等子进程；若在 Clash 中将上述进程设为 DIRECT，会导致后台请求直接暴露真实本地 IP！",
+                    "从 Clash rules 中移除针对 claude / cowork-svc / node / ssh / git / curl 的 PROCESS-NAME,xxx,DIRECT 规则。",
+                    severity="critical" if is_claude_proc_direct else "high",
+                )
+            )
+
+        if reject_risk_rules:
+            crit_reject = [
+                r for r in reject_risk_rules
+                if any(k in r.lower() for k in ("claude", "anthropic", "stripe", "hcaptcha", "cloudflare", "statsig"))
+            ]
+            checks.append(
+                _make_check(
+                    "clash_reject_telemetry",
+                    f"{client_label} 风控/遥测域名 REJECT 拦截副作用检测",
+                    "FAIL" if crit_reject else "WARN",
+                    f"命中 {len(reject_risk_rules)} 条 REJECT 规则: {', '.join(reject_risk_rules[:4])}",
+                    (
+                        "致命误伤！拦截 claude / anthropic / stripe / hcaptcha / statsig / downloads.claude.ai 会直接导致支付拒付、验证死循环或模型列表拉取失败！"
+                        if crit_reject
+                        else "检测到对 Sentry / Datadog 遥测域名的网络层 REJECT 拦截：逆向证实粗暴断网拦截会导致客户端在 sentry/queue 积压离线包并在主进程累加 desktop_telemetry_upload_lost 失败上报计数，且无法拦截走 claude.ai/api/v2/rum 的第一方转发。"
+                    ),
+                    "切勿用 REJECT/去广告规则硬拦 Claude/Stripe/Sentry 域名；应让它们统一走与 claude.ai 相同的代理出口，并通过官方环境变量（DISABLE_TELEMETRY=1 等）合规降噪。",
+                    severity="critical" if crit_reject else "low",
+                )
+            )
     else:
         checks.append(
             _make_check(
@@ -1320,6 +1381,7 @@ def win_audit_system(target_cfg: Dict[str, Any]) -> Dict[str, Any]:
     hosts_path = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "drivers", "etc", "hosts")
     custom_hosts: List[str] = []
     risky_hosts: List[str] = []
+    telemetry_blackhole_hosts: List[str] = []
     if os.path.isfile(hosts_path):
         try:
             with open(hosts_path, "r", encoding="utf-8", errors="replace") as f:
@@ -1330,18 +1392,37 @@ def win_audit_system(target_cfg: Dict[str, Any]) -> Dict[str, Any]:
                     parts = s.split()
                     if len(parts) >= 2 and parts[1].lower() not in {"localhost"}:
                         custom_hosts.append(s[:80])
-                        if any(k in s.lower() for k in ("claude", "anthropic", "stripe", "hcaptcha", "cloudflare", "statsig")):
+                        low_s = s.lower()
+                        if any(k in low_s for k in ("claude", "anthropic", "claudeusercontent", "claudemcpcontent", "stripe", "hcaptcha", "cloudflare", "statsig")):
                             risky_hosts.append(s[:80])
+                        elif any(k in low_s for k in ("sentry.io", "datadoghq.")):
+                            telemetry_blackhole_hosts.append(s[:80])
         except Exception:
             pass
     checks.append(
         _make_check(
             "etc_hosts",
-            "Windows hosts 域名劫持检测",
-            "FAIL" if risky_hosts else ("WARN" if custom_hosts else "PASS"),
-            f"命中风险域名 {len(risky_hosts)} 条" if risky_hosts else (f"发现 {len(custom_hosts)} 条自定义条目" if custom_hosts else "仅默认条目"),
-            f"风险条目: {'; '.join(risky_hosts[:4])}" if risky_hosts else (f"条目: {'; '.join(custom_hosts[:5])}" if custom_hosts else "hosts 文件无自定义劫持条目。"),
-            "立即清理 hosts 中关于 claude / anthropic / stripe / hcaptcha / cloudflare 的手动绑定！" if risky_hosts else ("确认其中不包含 claude / anthropic / stripe / cloudflare 的陈旧绑定。" if custom_hosts else ""),
+            "Windows hosts 域名劫持与遥测黑洞副作用检测",
+            "FAIL" if risky_hosts else ("WARN" if (telemetry_blackhole_hosts or custom_hosts) else "PASS"),
+            (
+                f"命中核心风险域名 {len(risky_hosts)} 条"
+                if risky_hosts
+                else (
+                    f"命中 Sentry/Datadog 黑洞绑定 {len(telemetry_blackhole_hosts)} 条"
+                    if telemetry_blackhole_hosts
+                    else (f"发现 {len(custom_hosts)} 条自定义条目" if custom_hosts else "仅默认条目")
+                )
+            ),
+            (
+                f"核心风险条目: {'; '.join(risky_hosts[:4])}"
+                if risky_hosts
+                else (
+                    f"遥测黑洞条目: {'; '.join(telemetry_blackhole_hosts[:4])}。用 hosts 屏蔽 Sentry/Datadog 会导致客户端离线队列积压并上报失败计数，建议移除黑洞绑定并改走统一代理出口。"
+                    if telemetry_blackhole_hosts
+                    else (f"条目: {'; '.join(custom_hosts[:5])}" if custom_hosts else "hosts 文件无自定义劫持条目。")
+                )
+            ),
+            "立即清理 hosts 中关于 claude / anthropic / stripe / hcaptcha / cloudflare 的手动绑定！" if risky_hosts else ("建议移除对 sentry.io / datadoghq 的 hosts 屏蔽，改用官方隐私环境变量。" if telemetry_blackhole_hosts else ("确认其中不包含 claude / anthropic / stripe / cloudflare 的陈旧绑定。" if custom_hosts else "")),
             severity="high" if risky_hosts else "low",
         )
     )
@@ -1595,6 +1676,69 @@ def win_audit_system(target_cfg: Dict[str, Any]) -> Dict[str, Any]:
     else:
         checks.append(_make_check("win_dns_cache", "Windows 系统 DNS 缓存陈旧记录检测 (displaydns)", "PASS", "未检出陈旧的非 Fake-IP 风控域名缓存", "系统 DNS 缓存中无残留的 Claude/Anthropic/Stripe/hCaptcha 非 Fake-IP 旧记录。"))
 
+    # 20. Official Claude Telemetry Opt-Out & Enterprise Policy Status (Read-Only)
+    tele_env_flags: List[str] = []
+    merged_env: Dict[str, Any] = {}
+    merged_env.update(_list_reg_values("HKEY_LOCAL_MACHINE", r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"))
+    merged_env.update(_list_reg_values("HKEY_CURRENT_USER", "Environment"))
+    merged_env.update(os.environ)
+    for tk in ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "DISABLE_TELEMETRY", "DO_NOT_TRACK"):
+        tv = str(merged_env.get(tk, "") or "").strip()
+        if tv and tv.lower() not in {"0", "false", "no", "off"}:
+            tele_env_flags.append(f"env:{tk}={tv}")
+
+    cc_settings_path = os.path.join(os.environ.get("USERPROFILE", os.path.expanduser("~")), ".claude", "settings.json")
+    if os.path.isfile(cc_settings_path):
+        try:
+            with open(cc_settings_path, "r", encoding="utf-8", errors="replace") as f:
+                cc_sd = json.load(f)
+            cc_senv = cc_sd.get("env") if isinstance(cc_sd.get("env"), dict) else {}
+            for tk in ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "DISABLE_TELEMETRY", "DO_NOT_TRACK"):
+                tv = str(cc_senv.get(tk, "") or "").strip()
+                if tv and tv.lower() not in {"0", "false", "no", "off"}:
+                    tag = f"settings.json:{tk}={tv}"
+                    if tag not in tele_env_flags:
+                        tele_env_flags.append(tag)
+        except Exception:
+            pass
+
+    gpo_flags: List[str] = []
+    for hive_n, hive_lbl in [("HKEY_LOCAL_MACHINE", "HKLM"), ("HKEY_CURRENT_USER", "HKCU")]:
+        pol_vals = _list_reg_values(hive_n, r"SOFTWARE\Policies\Claude")
+        for pk in ("disableNonessentialTelemetry", "disableEssentialTelemetry", "disableNonessentialServices", "disableAutoUpdates"):
+            if pk in pol_vals and pol_vals[pk] in (1, True, "1", "true"):
+                gpo_flags.append(f"{hive_lbl}:{pk}=1")
+
+    tele_fix_cmd = (
+        '[Environment]::SetEnvironmentVariable("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC","1","User"); '
+        '[Environment]::SetEnvironmentVariable("DISABLE_TELEMETRY","1","User"); '
+        '[Environment]::SetEnvironmentVariable("DO_NOT_TRACK","1","User")'
+    )
+    if tele_env_flags:
+        obs_tp = ", ".join(tele_env_flags) + (f" | GPO(仅3P生效): {', '.join(gpo_flags)}" if gpo_flags else "")
+        checks.append(
+            _make_check(
+                "claude_telemetry_privacy",
+                "Claude 官方遥测隐私开关状态 (CLI / 内置子进程 / GPO)",
+                "PASS",
+                obs_tp,
+                "已启用官方支持的环境变量遥测抑制（对 Claude Code CLI 及桌面端内置 fileIndexWorker/子进程全局生效，合规关闭非必要 OTel 与事件上报且不会触发上传失败计数器）。注：桌面端注册表策略 SOFTWARE\\Policies\\Claude 仅对 3P 企业部署生效，1P 账号请确保遥测域名统一走代理出口。",
+            )
+        )
+    else:
+        obs_tp = "未配置官方遥测抑制环境变量 (默认全量上报)" + (f" | 检测到 GPO(仅3P生效): {', '.join(gpo_flags)}" if gpo_flags else "")
+        checks.append(
+            _make_check(
+                "claude_telemetry_privacy",
+                "Claude 官方遥测隐私开关状态 (CLI / 内置子进程 / GPO)",
+                "INFO",
+                obs_tp,
+                "Claude Code 与桌面端内置子进程原生支持 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1、DISABLE_TELEMETRY=1 与 DO_NOT_TRACK=1 官方环境变量来合法关闭非必要遥测（切勿用 hosts/REJECT 硬拦遥测域名，否则会触发离线队列积压与失败计数上报）。",
+                "可选：执行下方 PowerShell 命令为当前用户写入官方遥测关闭环境变量（重启终端/Claude 后生效）。",
+                tele_fix_cmd,
+            )
+        )
+
     return {"title": "Windows 系统环境与指纹", "checks": checks}
 
 
@@ -1673,6 +1817,103 @@ def _scan_chromium_profile_unlocked(pdir: str) -> Dict[str, Any]:
     return res
 
 
+def _inspect_desktop_telemetry_artifacts(cdir: str, r_label: str) -> Dict[str, Any]:
+    """
+    Strictly read-only & redacted deep audit of Claude Desktop local telemetry caches:
+    - sentry/scope_v3.json: checks cached culture.locale & culture.timezone (e.g. zh-CN / Asia/Shanghai) and user.id presence
+    - sentry/queue: checks non-empty offline queued crash/telemetry envelopes waiting to flush
+    - fcache: decompresses CLF\\x03\\x00 + gzip GrowthBook cache to check cached orgUuid & feature flags (zero secret exposure)
+    """
+    out: Dict[str, Any] = {
+        "sentry_notes": [],
+        "sentry_status": "PASS",
+        "sentry_critical": False,
+        "fcache_notes": [],
+        "fcache_status": "PASS",
+    }
+    scope_path = os.path.join(cdir, "sentry", "scope_v3.json")
+    if os.path.isfile(scope_path):
+        out["sentry_status"] = "WARN"
+        try:
+            with open(scope_path, "r", encoding="utf-8", errors="replace") as f:
+                sc = json.load(f)
+            ev = sc.get("event") if isinstance(sc.get("event"), dict) else {}
+            ctxs = ev.get("contexts") if isinstance(ev.get("contexts"), dict) else {}
+            culture = ctxs.get("culture") if isinstance(ctxs.get("culture"), dict) else {}
+            app_ctx = ctxs.get("app") if isinstance(ctxs.get("app"), dict) else {}
+            scope_blk = sc.get("scope") if isinstance(sc.get("scope"), dict) else {}
+            has_uid = bool((scope_blk.get("user") or {}).get("id")) if isinstance(scope_blk.get("user"), dict) else False
+            loc = str(culture.get("locale") or "").strip()
+            tz = str(culture.get("timezone") or "").strip()
+            btype = str(app_ctx.get("build_type") or "").strip()
+            parts = []
+            if loc or tz:
+                parts.append(f"culture={loc or '-'}/{tz or '-'}")
+            if has_uid:
+                parts.append("含设备UUID绑定(已脱敏)")
+            if btype:
+                parts.append(f"build={btype}")
+            is_bad_tz = tz in RESTRICTED_TIMEZONES
+            is_bad_loc = loc.lower().startswith(("zh-cn", "zh_cn", "zh-hans"))
+            if is_bad_tz or is_bad_loc:
+                out["sentry_status"] = "FAIL"
+                out["sentry_critical"] = is_bad_tz
+                parts.append("暴露受限区时区/简中环境!")
+            elif has_uid:
+                out["sentry_status"] = "FAIL"
+            out["sentry_notes"].append(f"{r_label}\\sentry\\scope_v3.json({', '.join(parts) or '存在'})")
+        except Exception:
+            out["sentry_notes"].append(f"{r_label}\\sentry\\scope_v3.json(存在)")
+
+    q_dir = os.path.join(cdir, "sentry", "queue")
+    if os.path.isdir(q_dir):
+        q_envelopes = 0
+        try:
+            for fn in os.listdir(q_dir):
+                fp = os.path.join(q_dir, fn)
+                if fn == "queue-v2.json" and os.path.isfile(fp):
+                    try:
+                        with open(fp, "r", encoding="utf-8", errors="replace") as qf:
+                            q_arr = json.load(qf)
+                        if isinstance(q_arr, list):
+                            q_envelopes = max(q_envelopes, len(q_arr))
+                    except Exception:
+                        pass
+                elif os.path.isfile(fp) and os.path.getsize(fp) > 2:
+                    q_envelopes += 1
+        except Exception:
+            pass
+        if q_envelopes > 0:
+            out["sentry_notes"].append(f"{r_label}\\sentry\\queue(积压 {q_envelopes} 个待补发离线包!)")
+            if out["sentry_status"] == "PASS":
+                out["sentry_status"] = "WARN"
+
+    fcache_path = os.path.join(cdir, "fcache")
+    if os.path.isfile(fcache_path):
+        out["fcache_status"] = "WARN"
+        try:
+            with open(fcache_path, "rb") as ff:
+                raw = ff.read(2 * 1024 * 1024)
+            gz_idx = raw.find(b"\x1f\x8b\x08", 0, 32) if raw[:3] == b"CLF" else -1
+            if gz_idx != -1:
+                dec = zlib.decompress(raw[gz_idx:], 16 + zlib.MAX_WBITS)
+                fc_obj = json.loads(dec.decode("utf-8", errors="replace"))
+                has_org = bool(fc_obj.get("orgUuid"))
+                mode = str(fc_obj.get("mode") or "-")
+                fcnt = len(fc_obj.get("features") or {}) if isinstance(fc_obj.get("features"), dict) else 0
+                f_parts = [f"mode={mode}", f"features={fcnt}"]
+                if has_org:
+                    f_parts.append("含旧orgUuid(已脱敏)")
+                    out["fcache_status"] = "FAIL"
+                out["fcache_notes"].append(f"{r_label}\\fcache({', '.join(f_parts)})")
+            else:
+                out["fcache_notes"].append(f"{r_label}\\fcache({len(raw)}B)")
+        except Exception:
+            out["fcache_notes"].append(f"{r_label}\\fcache(存在)")
+
+    return out
+
+
 def win_audit_claude_browser_residue() -> Dict[str, Any]:
     """Windows comprehensive Claude Desktop (Standard + MSIX), CLI, Credential Manager, Temp, IDE & Browser audit."""
     checks: List[Dict[str, str]] = []
@@ -1709,13 +1950,25 @@ def win_audit_claude_browser_residue() -> Dict[str, Any]:
             except Exception:
                 pass
 
-    # 1. Running processes & Installed App / CLI
+    # 1. Running processes & Installed App / CLI (including v6.x cowork-svc VM daemon & SSH/MCP helpers)
     _, tl_out, _ = _run_win_cmd(["tasklist", "/FO", "CSV", "/NH"], timeout=4)
     all_procs = _parse_tasklist_csv(tl_out)
-    running_claude = [
-        p for p in all_procs
-        if p.lower() in {"claude.exe", "claude-code.exe", "anthropicclaude.exe", "claude-desktop.exe"}
-    ]
+    claude_proc_names = {
+        "claude.exe",
+        "claude-code.exe",
+        "anthropicclaude.exe",
+        "claude-desktop.exe",
+        "cowork-svc.exe",
+        "claude-ssh-broker.exe",
+        "claude-ssh-proxy.exe",
+        "claude-ssh-askpass.exe",
+        "chrome-native-host.exe",
+        "github-mcp-server.exe",
+    }
+    running_claude = [p for p in all_procs if p.lower() in claude_proc_names]
+    bg_helpers_only = bool(running_claude) and not any(
+        p.lower() in {"claude.exe", "anthropicclaude.exe", "claude-desktop.exe"} for p in running_claude
+    )
     installed_apps = [
         p
         for p in [
@@ -1732,34 +1985,63 @@ def win_audit_claude_browser_residue() -> Dict[str, Any]:
     ]
     cli_bin = next((p for p in cli_candidates if p and os.path.exists(p)), "")
     proc_obs = (
-        f"进程={len(running_claude)} ({', '.join(running_claude[:3])})" if running_claude else "进程=未运行"
+        f"进程={len(running_claude)} ({', '.join(running_claude[:4])})" if running_claude else "进程=未运行"
     ) + f" | Desktop App={'已安装(' + ('MSIX' if msix_pkg_dirs else '传统') + ')' if installed_apps else '未安装'} | CLI={'已安装(' + cli_bin + ')' if cli_bin else '未安装'}"
+    proc_status = "WARN" if bg_helpers_only else ("INFO" if (running_claude or installed_apps or cli_bin) else "PASS")
     checks.append(
         _make_check(
             "claude_proc",
-            "Claude 安装状态与后台进程 (Windows)",
-            "INFO" if (running_claude or installed_apps or cli_bin) else "PASS",
+            "Claude 安装状态与后台子进程 / Cowork VM 服务 (Windows)",
+            proc_status,
             proc_obs,
-            "清理本地残留或切换新号前，请先在任务管理器中彻底结束所有 Claude.exe 进程。",
+            (
+                f"注意：主界面虽未运行，但后台辅助服务 ({', '.join(running_claude)}) 仍在常驻运行！清理残留或切换环境前必须一并结束。"
+                if bg_helpers_only
+                else "已覆盖主进程与新版 cowork-svc.exe（内置轻量级 VM 服务）、claude-ssh-proxy.exe、chrome-native-host.exe 等辅助守护进程。"
+            ),
+            "在任务管理器或 PowerShell 中结束全部 claude / cowork-svc / chrome-native-host 进程后再清理残留。" if bg_helpers_only else "",
         )
     )
     add_inv(
         "运行与程序",
-        "Claude.exe / MSIX / CLI / 进程",
-        r"%LOCALAPPDATA%\Packages\Claude_* · %LOCALAPPDATA%\AnthropicClaude · PATH\claude",
-        "确认是否存在桌面端（传统/MSIX 容器）或 CLI 后台常驻进程",
+        "Claude.exe / cowork-svc / MSIX / CLI",
+        r"%LOCALAPPDATA%\Packages\Claude_* · cowork-svc.exe · claude-ssh-* · PATH\claude",
+        "确认是否存在桌面端主进程、Cowork 虚拟机后台服务或 CLI 守护进程",
         proc_obs,
-        "INFO" if (running_claude or installed_apps or cli_bin) else "PASS",
+        proc_status,
     )
 
-    # 2. Claude Desktop Files & Deep Fingerprint Inspection (BOTH %APPDATA%\Claude AND MSIX LocalCache\Roaming\Claude!)
+    # 2. Claude Desktop Files & Deep Fingerprint Inspection (Standard %APPDATA% + MSIX Roaming & LocalCache\Local!)
     claude_data_roots: List[Tuple[str, str]] = []
     if appdata and os.path.isdir(os.path.join(appdata, "Claude")):
         claude_data_roots.append((r"%APPDATA%\Claude", os.path.join(appdata, "Claude")))
+    if localappdata:
+        for extra_ld in ("Claude", "Claude-3p"):
+            elp = os.path.join(localappdata, extra_ld)
+            if os.path.isdir(elp):
+                claude_data_roots.append((rf"%LOCALAPPDATA%\{extra_ld}", elp))
+
+    msix_local_extras: List[str] = []
+    msix_cli_dirs: List[str] = []
     for mpkg in msix_pkg_dirs:
+        pkg_short = os.path.basename(mpkg)
         m_roaming = os.path.join(mpkg, "LocalCache", "Roaming", "Claude")
         if os.path.isdir(m_roaming):
-            claude_data_roots.append((f"MSIX({os.path.basename(mpkg)})\\Roaming\\Claude", m_roaming))
+            claude_data_roots.append((f"MSIX({pkg_short})\\Roaming\\Claude", m_roaming))
+        for m_loc_sub in ("Claude", "Claude-3p"):
+            m_loc_p = os.path.join(mpkg, "LocalCache", "Local", m_loc_sub)
+            if os.path.isdir(m_loc_p):
+                claude_data_roots.append((f"MSIX({pkg_short})\\Local\\{m_loc_sub}", m_loc_p))
+                msix_local_extras.append(f"Local\\{m_loc_sub}")
+        m_cli_p = os.path.join(mpkg, "LocalCache", "Local", "claude-cli-nodejs")
+        if os.path.isdir(m_cli_p):
+            msix_cli_dirs.append(m_cli_p)
+            msix_local_extras.append("Local\\claude-cli-nodejs")
+        m_dpapi_p = os.path.join(mpkg, "LocalCache", "Local", "ASP.NET", "DataProtection-Keys")
+        if os.path.isdir(m_dpapi_p):
+            msix_local_extras.append("Local\\ASP.NET\\DataProtection-Keys")
+        if os.path.isfile(os.path.join(mpkg, "SystemAppData", "Helium", "User.dat")):
+            msix_local_extras.append("SystemAppData\\Helium\\User.dat")
 
     claude_paths = [
         p
@@ -1774,7 +2056,7 @@ def win_audit_claude_browser_residue() -> Dict[str, Any]:
         if p and os.path.exists(p)
     ]
     desktop_clean_cmd = (
-        'Get-Process *claude* -ErrorAction SilentlyContinue | Stop-Process -Force; '
+        'Get-Process *claude*,*cowork-svc*,*chrome-native-host* -ErrorAction SilentlyContinue | Stop-Process -Force; '
         'Remove-Item -Recurse -Force "$env:APPDATA\\Claude","$env:LOCALAPPDATA\\AnthropicClaude",'
         '"$env:LOCALAPPDATA\\claude-desktop-updater","$env:LOCALAPPDATA\\Claude",'
         '"$env:LOCALAPPDATA\\Claude-3p","$env:LOCALAPPDATA\\Claude-Data",'
@@ -1796,6 +2078,10 @@ def win_audit_claude_browser_residue() -> Dict[str, Any]:
     log_notes: List[str] = []
     log_st = "PASS"
     sub_hits: List[str] = []
+    sentry_notes: List[str] = []
+    sentry_st = "PASS"
+    fcache_notes: List[str] = []
+    fcache_st = "PASS"
 
     for r_label, cdir in claude_data_roots:
         # ant-did
@@ -1909,35 +2195,60 @@ def win_audit_claude_browser_residue() -> Dict[str, Any]:
             except Exception:
                 cfg_notes.append(f"{r_label} claude_desktop_config.json 存在")
 
-        # Logs
+        # Logs (including v6.x EventLogging batch rejection, login eviction & bad_device_id)
         log_dir = os.path.join(cdir, "logs")
         if os.path.isdir(log_dir):
-            rb_cnt = ban_cnt = stripe_cnt = net_cnt = 0
+            rb_cnt = ban_cnt = stripe_cnt = net_cnt = evict_cnt = tele_err_cnt = 0
             lfiles = [fn for fn in os.listdir(log_dir) if fn.endswith(".log") and os.path.isfile(os.path.join(log_dir, fn))]
             for fn in lfiles:
                 try:
                     with open(os.path.join(log_dir, fn), "r", encoding="utf-8", errors="replace") as f:
                         txt = f.read()
                     rb_cnt += txt.count("region_blocked") + txt.count("isn't available in your region")
-                    ban_cnt += txt.count("account_banned")
+                    ban_cnt += txt.count("account_banned") + txt.count("bad_device_id")
+                    evict_cnt += txt.count("Claude-Login-Ended-By") + txt.count("login_limit_reached")
+                    tele_err_cnt += txt.count("[EventLogging] Batch flush FAILED")
                     stripe_cnt += txt.count("Failed to load Stripe.js")
                     net_cnt += txt.count("ERR_NETWORK_CHANGED")
                 except Exception:
                     pass
-            l_obs = f"{r_label}: {len(lfiles)}日志(region_blocked={rb_cnt}, banned={ban_cnt}, Stripe失败={stripe_cnt}, 断流={net_cnt})"
+            l_obs = (
+                f"{r_label}: {len(lfiles)}日志(region_blocked={rb_cnt}, banned/bad_did={ban_cnt}, "
+                f"踢号={evict_cnt}, 遥测拒签={tele_err_cnt}, Stripe失败={stripe_cnt}, 断流={net_cnt})"
+            )
             log_notes.append(l_obs)
-            if rb_cnt or ban_cnt:
+            if rb_cnt or ban_cnt or evict_cnt:
                 log_st = "FAIL"
                 desktop_status = "FAIL"
                 desktop_sev = "high"
-            elif log_st == "PASS" and lfiles:
+            elif log_st == "PASS" and (lfiles or tele_err_cnt):
                 log_st = "WARN"
+
+        # Deep Telemetry Artifacts: sentry/scope_v3.json, sentry/queue & fcache
+        tele_art = _inspect_desktop_telemetry_artifacts(cdir, r_label)
+        if tele_art["sentry_notes"]:
+            sentry_notes.extend(tele_art["sentry_notes"])
+            if tele_art["sentry_status"] == "FAIL":
+                sentry_st = "FAIL"
+                desktop_status = "FAIL"
+                desktop_sev = "critical" if tele_art["sentry_critical"] else "high"
+            elif sentry_st == "PASS":
+                sentry_st = tele_art["sentry_status"]
+        if tele_art["fcache_notes"]:
+            fcache_notes.extend(tele_art["fcache_notes"])
+            if tele_art["fcache_status"] == "FAIL":
+                fcache_st = "FAIL"
+                desktop_status = "FAIL"
+                if desktop_sev != "critical":
+                    desktop_sev = "high"
+            elif fcache_st == "PASS":
+                fcache_st = tele_art["fcache_status"]
 
         # Sub-storages
         sub_names = [
             "Trust Tokens", os.path.join("Network", "Trust Tokens"), "DIPS", "SharedStorage",
             "Local Storage", "Session Storage", "IndexedDB", "Cache", "Code Cache",
-            "GPUCache", "sentry", "Crashpad", "Service Worker", "WebStorage",
+            "GPUCache", "fcache", "sentry", "Crashpad", "Service Worker", "WebStorage",
             os.path.join("Network", "Network Persistent State"),
             os.path.join("Network", "TransportSecurity"),
         ]
@@ -1945,8 +2256,15 @@ def win_audit_claude_browser_residue() -> Dict[str, Any]:
         if exist_subs:
             sub_hits.append(f"{r_label}({len(exist_subs)}项: {', '.join(exist_subs[:5])})")
 
+    if msix_local_extras:
+        sub_hits.append(f"MSIX深层目录({', '.join(dict.fromkeys(msix_local_extras))})")
+
     if ant_did_hits:
         desktop_details.append(f"存在 ant-did: {'; '.join(ant_did_hits)}")
+    if sentry_notes:
+        desktop_details.extend(sentry_notes)
+    if fcache_notes:
+        desktop_details.extend(fcache_notes)
     if cookie_notes:
         desktop_details.extend(cookie_notes)
     if pref_notes:
@@ -1963,6 +2281,24 @@ def win_audit_claude_browser_residue() -> Dict[str, Any]:
         "Anthropic 跨账号关联核心设备指纹文件（Windows MSIX 安装会虚拟化存放在 Packages 容器内！）",
         "; ".join(ant_did_hits) if ant_did_hits else "已清理 (0 残留)",
         "FAIL" if ant_did_hits else "PASS",
+    )
+    add_inv(
+        "Claude Desktop",
+        "Sentry 启动环境快照与离线待发队列",
+        r"Claude\sentry\scope_v3.json · Claude\sentry\queue",
+        "启动瞬间（未登录前）即落盘记录 culture(locale/timezone 如 zh-CN/Asia/Shanghai)、GPU/CPU 指纹与设备 UUID",
+        "；".join(sentry_notes) if sentry_notes else "已清理 (0 残留)",
+        sentry_st,
+    )
+    add_inv(
+        "Claude Desktop",
+        "fcache 实验网关缓存 & MSIX Local 层",
+        r"Claude\fcache · MSIX LocalCache\Local\{Claude-3p, claude-cli-nodejs}",
+        "CLF+Gzip 压缩存储旧账号 orgUuid 与 GrowthBook 开关，及 MSIX Local 层重定向配置",
+        "；".join(fcache_notes + ([f"MSIX额外项: {', '.join(dict.fromkeys(msix_local_extras))}"] if msix_local_extras else []))
+        if (fcache_notes or msix_local_extras)
+        else "已清理 (0 残留)",
+        fcache_st if fcache_st == "FAIL" else ("WARN" if (fcache_notes or msix_local_extras) else "PASS"),
     )
     add_inv(
         "Claude Desktop",
@@ -2033,7 +2369,7 @@ def win_audit_claude_browser_residue() -> Dict[str, Any]:
             os.path.join(userprofile, ".config", "claude"),
             os.path.join(userprofile, ".cache", "claude"),
             os.path.join(localappdata, "claude-cli-nodejs") if localappdata else "",
-        ]
+        ] + msix_cli_dirs
         if p and os.path.exists(p)
     ]
     cc_notes: List[str] = []

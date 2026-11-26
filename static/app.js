@@ -148,10 +148,10 @@
     if (invSub) {
       if (plat === "windows") {
         invSub.textContent =
-          "覆盖 Desktop 指纹文件（传统 %APPDATA%\\Claude 与 MSIX Packages\\Claude_* 虚拟化容器、ant-did / Cookies / device_id_salt / 日志）、Claude Code CLI、Windows 凭据管理器、AppData/Temp/IDE 与 Chrome/Edge/Brave/Arc/Firefox 站点残留（纯只读脱敏）";
+          "覆盖 Desktop 深度遥测与指纹文件（传统 %APPDATA%\\Claude 与 MSIX Roaming/Local 容器、ant-did / sentry\\scope_v3.json / fcache / Cookies / cowork-svc 进程 / 日志）、Claude Code CLI、凭据管理器、AppData/Temp/IDE 与全浏览器站点残留（纯只读脱敏）";
       } else {
         invSub.textContent =
-          "覆盖 Desktop 指纹文件（ant-did / Cookies / device_id_salt / config / 日志）、Claude Code CLI、全库钥匙串、~/Library 12 子目录、崩溃/临时/IDE 与 Safari WebsiteData / ITP / 历史（纯只读脱敏）";
+          "覆盖 Desktop 深度遥测与指纹文件（ant-did / sentry/scope_v3.json / fcache / Cookies / device_id_salt / config / 日志）、Claude Code CLI、全库钥匙串、~/Library 12 子目录与 Safari/Chrome 站点残留（纯只读脱敏）";
       }
     }
     const chkProf = $("chkProfileText");
