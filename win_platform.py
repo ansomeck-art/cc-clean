@@ -13,6 +13,7 @@ import glob
 import json
 import locale
 import os
+from audit_common import count_log_tail, inspect_telemetry, RISK_ROOTS, risk_tags
 import re
 import shutil
 import socket
@@ -171,6 +172,8 @@ CLAUDE_RISK_DOMAINS = (
     "stripe.com",
     "stripe.network",
 )
+CLAUDE_RISK_DOMAINS = tuple(dict.fromkeys(CLAUDE_RISK_DOMAINS + RISK_ROOTS))
+
 CN_DNS_SERVERS = {
     "114.114.114.114",
     "114.114.115.115",
@@ -730,6 +733,23 @@ def win_check_tun_status() -> Tuple[bool, List[str], List[str], List[str]]:
     return d["tun_up"], d["tun_ips"], d["default_routes"], d["global_v6"]
 
 
+def _reg_value_present(root_name: str, subkey: str, value_name: str) -> bool:
+    """Query registry type/size only. Never retrieve proxy, PAC or credential bytes."""
+    if winreg is None:
+        return False
+    try:
+        from ctypes import wintypes
+        with winreg.OpenKey(getattr(winreg, root_name), subkey, 0, winreg.KEY_READ) as key:
+            api = ctypes.WinDLL("advapi32", use_last_error=True).RegQueryValueExW
+            api.argtypes = [wintypes.HKEY, wintypes.LPCWSTR, wintypes.LPDWORD,
+                            wintypes.LPDWORD, wintypes.LPVOID, wintypes.LPDWORD]
+            api.restype = wintypes.LONG
+            kind, size = wintypes.DWORD(), wintypes.DWORD()
+            return api(int(key), value_name, None, ctypes.byref(kind), None, ctypes.byref(size)) == 0 and size.value > 2
+    except (OSError, AttributeError, TypeError):
+        return False
+
+
 def win_check_dns_and_proxy(tun_details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Windows equivalent of _check_dns_and_proxy_scutil (WinINET + WinHTTP + per-adapter DNS)."""
     if tun_details is None:
@@ -737,18 +757,18 @@ def win_check_dns_and_proxy(tun_details: Optional[Dict[str, Any]] = None) -> Dic
 
     inet_key = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
     proxy_enable = bool(_read_reg("HKEY_CURRENT_USER", inet_key, "ProxyEnable", 0))
-    proxy_server = str(_read_reg("HKEY_CURRENT_USER", inet_key, "ProxyServer", "") or "").strip()
-    pac_url = str(_read_reg("HKEY_CURRENT_USER", inet_key, "AutoConfigURL", "") or "").strip()
+    proxy_server = _reg_value_present("HKEY_CURRENT_USER", inet_key, "ProxyServer")
+    pac_url = _reg_value_present("HKEY_CURRENT_USER", inet_key, "AutoConfigURL")
     proxy_override = str(_read_reg("HKEY_CURRENT_USER", inet_key, "ProxyOverride", "") or "").strip()
 
     proxies: Dict[str, str] = {}
     if proxy_enable and proxy_server:
         proxies["ProxyEnable"] = "1"
-        proxies["ProxyServer"] = re.sub(r"://[^/@\s]+@", "://<REDACTED>@", proxy_server)
+        proxies["ProxyServer"] = "已配置(地址未读取)"
     if pac_url:
-        proxies["AutoConfigURL"] = re.sub(r"://[^/@\s]+@", "://<REDACTED>@", pac_url)
+        proxies["AutoConfigURL"] = "已配置(链接未读取)"
     if proxy_override:
-        proxies["ProxyOverride"] = proxy_override[:140]
+        proxies["ProxyOverride"] = "存在绕过规则(仅报告风险类型)"
 
     bypass_risk: List[str] = []
     if proxy_override:
@@ -771,7 +791,7 @@ def win_check_dns_and_proxy(tun_details: Optional[Dict[str, Any]] = None) -> Dic
                     "datadog",
                 )
             ):
-                bypass_risk.append(tok.strip())
+                bypass_risk.extend(risk_tags(tok))
 
     # WinHTTP proxy check (best-effort; some minimal Windows editions omit winhttp netsh helper)
     winhttp_proxy = ""
@@ -781,10 +801,8 @@ def win_check_dns_and_proxy(tun_details: Optional[Dict[str, Any]] = None) -> Dic
         if "direct access" not in low_wh and "直接访问" not in low_wh:
             for line in wh_out.splitlines():
                 if ":" in line and any(k in line.lower() for k in ("proxy server", "代理服务器")):
-                    val = line.split(":", 1)[1].strip()
-                    if val:
-                        winhttp_proxy = re.sub(r"://[^/@\s]+@", "://<REDACTED>@", val)
-                        break
+                    winhttp_proxy = "已配置(地址未解析)"
+                    break
 
     return {
         "dns_servers": tun_details["dns_servers"],
@@ -1345,26 +1363,23 @@ def win_audit_system(target_cfg: Dict[str, Any]) -> Dict[str, Any]:
     }
     env_findings: List[str] = []
     env_risky = False
-    for scope, kv in [
-        ("proc", dict(os.environ)),
-        ("HKCU", _list_reg_values("HKEY_CURRENT_USER", "Environment")),
-        ("HKLM", _list_reg_values("HKEY_LOCAL_MACHINE", r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment")),
-    ]:
-        for k, v in kv.items():
-            if k not in env_keys and not k.upper().startswith(("ANTHROPIC_", "CLAUDE_")):
+    scopes = [("proc", None, None), ("HKCU", "HKEY_CURRENT_USER", "Environment"),
+              ("HKLM", "HKEY_LOCAL_MACHINE", r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment")]
+    for scope, root, subkey in scopes:
+        for k in sorted(env_keys):
+            present = k in os.environ if scope == "proc" else _reg_value_present(root, subkey, k)
+            if not present:
                 continue
-            sv = str(v or "").strip()
-            if not sv:
-                continue
-            if any(sec in k.upper() for sec in ("KEY", "TOKEN", "SECRET", "PASSWORD")):
-                entry = f"{scope}:{k}=<REDACTED>"
+            # Only locale fields may be read. Secrets/URLs/addresses are presence-only.
+            if k in {"TZ", "LANG", "LC_ALL"}:
+                value = os.environ.get(k, "") if scope == "proc" else _read_reg(root, subkey, k, "")
+                bad = any(x in str(value).lower() for x in ("shanghai", "zh_cn", "zh-cn", "zh-hans"))
+                entry = f"{scope}:{k}=" + ("受限区域特征" if bad else "已设置")
+                env_risky |= bad
             else:
-                clean_v = re.sub(r"://[^/@\s]+@", "://<REDACTED>@", sv)
-                entry = f"{scope}:{k}={clean_v}"
-                if "proxy" in k.lower() or k.upper() == "ANTHROPIC_BASE_URL" or any(x in sv.lower() for x in ("shanghai", "zh_cn", "zh-cn")):
-                    env_risky = True
-            if entry not in env_findings:
-                env_findings.append(entry)
+                entry = f"{scope}:{k}=存在(值未读取)"
+                env_risky |= "proxy" in k.lower() or k == "ANTHROPIC_BASE_URL"
+            env_findings.append(entry)
     checks.append(
         _make_check(
             "shell_proxy_env",
@@ -1818,100 +1833,8 @@ def _scan_chromium_profile_unlocked(pdir: str) -> Dict[str, Any]:
 
 
 def _inspect_desktop_telemetry_artifacts(cdir: str, r_label: str) -> Dict[str, Any]:
-    """
-    Strictly read-only & redacted deep audit of Claude Desktop local telemetry caches:
-    - sentry/scope_v3.json: checks cached culture.locale & culture.timezone (e.g. zh-CN / Asia/Shanghai) and user.id presence
-    - sentry/queue: checks non-empty offline queued crash/telemetry envelopes waiting to flush
-    - fcache: decompresses CLF\\x03\\x00 + gzip GrowthBook cache to check cached orgUuid & feature flags (zero secret exposure)
-    """
-    out: Dict[str, Any] = {
-        "sentry_notes": [],
-        "sentry_status": "PASS",
-        "sentry_critical": False,
-        "fcache_notes": [],
-        "fcache_status": "PASS",
-    }
-    scope_path = os.path.join(cdir, "sentry", "scope_v3.json")
-    if os.path.isfile(scope_path):
-        out["sentry_status"] = "WARN"
-        try:
-            with open(scope_path, "r", encoding="utf-8", errors="replace") as f:
-                sc = json.load(f)
-            ev = sc.get("event") if isinstance(sc.get("event"), dict) else {}
-            ctxs = ev.get("contexts") if isinstance(ev.get("contexts"), dict) else {}
-            culture = ctxs.get("culture") if isinstance(ctxs.get("culture"), dict) else {}
-            app_ctx = ctxs.get("app") if isinstance(ctxs.get("app"), dict) else {}
-            scope_blk = sc.get("scope") if isinstance(sc.get("scope"), dict) else {}
-            has_uid = bool((scope_blk.get("user") or {}).get("id")) if isinstance(scope_blk.get("user"), dict) else False
-            loc = str(culture.get("locale") or "").strip()
-            tz = str(culture.get("timezone") or "").strip()
-            btype = str(app_ctx.get("build_type") or "").strip()
-            parts = []
-            if loc or tz:
-                parts.append(f"culture={loc or '-'}/{tz or '-'}")
-            if has_uid:
-                parts.append("含设备UUID绑定(已脱敏)")
-            if btype:
-                parts.append(f"build={btype}")
-            is_bad_tz = tz in RESTRICTED_TIMEZONES
-            is_bad_loc = loc.lower().startswith(("zh-cn", "zh_cn", "zh-hans"))
-            if is_bad_tz or is_bad_loc:
-                out["sentry_status"] = "FAIL"
-                out["sentry_critical"] = is_bad_tz
-                parts.append("暴露受限区时区/简中环境!")
-            elif has_uid:
-                out["sentry_status"] = "FAIL"
-            out["sentry_notes"].append(f"{r_label}\\sentry\\scope_v3.json({', '.join(parts) or '存在'})")
-        except Exception:
-            out["sentry_notes"].append(f"{r_label}\\sentry\\scope_v3.json(存在)")
-
-    q_dir = os.path.join(cdir, "sentry", "queue")
-    if os.path.isdir(q_dir):
-        q_envelopes = 0
-        try:
-            for fn in os.listdir(q_dir):
-                fp = os.path.join(q_dir, fn)
-                if fn == "queue-v2.json" and os.path.isfile(fp):
-                    try:
-                        with open(fp, "r", encoding="utf-8", errors="replace") as qf:
-                            q_arr = json.load(qf)
-                        if isinstance(q_arr, list):
-                            q_envelopes = max(q_envelopes, len(q_arr))
-                    except Exception:
-                        pass
-                elif os.path.isfile(fp) and os.path.getsize(fp) > 2:
-                    q_envelopes += 1
-        except Exception:
-            pass
-        if q_envelopes > 0:
-            out["sentry_notes"].append(f"{r_label}\\sentry\\queue(积压 {q_envelopes} 个待补发离线包!)")
-            if out["sentry_status"] == "PASS":
-                out["sentry_status"] = "WARN"
-
-    fcache_path = os.path.join(cdir, "fcache")
-    if os.path.isfile(fcache_path):
-        out["fcache_status"] = "WARN"
-        try:
-            with open(fcache_path, "rb") as ff:
-                raw = ff.read(2 * 1024 * 1024)
-            gz_idx = raw.find(b"\x1f\x8b\x08", 0, 32) if raw[:3] == b"CLF" else -1
-            if gz_idx != -1:
-                dec = zlib.decompress(raw[gz_idx:], 16 + zlib.MAX_WBITS)
-                fc_obj = json.loads(dec.decode("utf-8", errors="replace"))
-                has_org = bool(fc_obj.get("orgUuid"))
-                mode = str(fc_obj.get("mode") or "-")
-                fcnt = len(fc_obj.get("features") or {}) if isinstance(fc_obj.get("features"), dict) else 0
-                f_parts = [f"mode={mode}", f"features={fcnt}"]
-                if has_org:
-                    f_parts.append("含旧orgUuid(已脱敏)")
-                    out["fcache_status"] = "FAIL"
-                out["fcache_notes"].append(f"{r_label}\\fcache({', '.join(f_parts)})")
-            else:
-                out["fcache_notes"].append(f"{r_label}\\fcache({len(raw)}B)")
-        except Exception:
-            out["fcache_notes"].append(f"{r_label}\\fcache(存在)")
-
-    return out
+    # Shared redacted semantics; keep Windows public signature stable.
+    return inspect_telemetry(cdir)
 
 
 def win_audit_claude_browser_residue() -> Dict[str, Any]:
@@ -2202,14 +2125,13 @@ def win_audit_claude_browser_residue() -> Dict[str, Any]:
             lfiles = [fn for fn in os.listdir(log_dir) if fn.endswith(".log") and os.path.isfile(os.path.join(log_dir, fn))]
             for fn in lfiles:
                 try:
-                    with open(os.path.join(log_dir, fn), "r", encoding="utf-8", errors="replace") as f:
-                        txt = f.read()
-                    rb_cnt += txt.count("region_blocked") + txt.count("isn't available in your region")
-                    ban_cnt += txt.count("account_banned") + txt.count("bad_device_id")
-                    evict_cnt += txt.count("Claude-Login-Ended-By") + txt.count("login_limit_reached")
-                    tele_err_cnt += txt.count("[EventLogging] Batch flush FAILED")
-                    stripe_cnt += txt.count("Failed to load Stripe.js")
-                    net_cnt += txt.count("ERR_NETWORK_CHANGED")
+                    counts = count_log_tail(os.path.join(log_dir, fn))
+                    rb_cnt += counts["region"]
+                    ban_cnt += counts["banned"]
+                    evict_cnt += counts["evicted"]
+                    tele_err_cnt += counts["telemetry"]
+                    stripe_cnt += counts["stripe"]
+                    net_cnt += counts["network"]
                 except Exception:
                     pass
             l_obs = (
@@ -2417,11 +2339,10 @@ def win_audit_claude_browser_residue() -> Dict[str, Any]:
                         sd = json.load(f)
                     s_env = sd.get("env") if isinstance(sd.get("env"), dict) else {}
                     for ek in ("ANTHROPIC_BASE_URL", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
-                        if s_env.get(ek):
-                            clean_ev = re.sub(r"://[^/@\s]+@", "://<REDACTED>@", str(s_env[ek]))
-                            cc_notes.append(f"{sf}:{ek}={clean_ev}")
-                            if ek == "ANTHROPIC_BASE_URL" and "api.anthropic.com" not in clean_ev.lower():
-                                relay_hits.append(f"{sf}:ANTHROPIC_BASE_URL={clean_ev}")
+                        if ek in s_env:
+                            cc_notes.append(f"{sf}:{ek}=存在(值未读取)")
+                            if ek == "ANTHROPIC_BASE_URL":
+                                relay_hits.append(f"{sf}:自定义端点标记(值未读取)")
                     if sd.get("apiKeyHelper"):
                         cc_notes.append(f"{sf} 含 apiKeyHelper")
                         relay_hits.append(f"{sf}:apiKeyHelper")
@@ -2443,23 +2364,22 @@ def win_audit_claude_browser_residue() -> Dict[str, Any]:
     ]:
         if os.path.exists(h_path):
             relay_hits.append(f"工具目录:{h_lbl}")
-    env_bu = os.environ.get("ANTHROPIC_BASE_URL", "").strip()
-    if env_bu and "api.anthropic.com" not in env_bu.lower():
-        safe_env_bu = re.sub(r"://[^/@\s]+@", "://<REDACTED>@", env_bu)
-        relay_hits.append(f"env:ANTHROPIC_BASE_URL={safe_env_bu}")
+    if "ANTHROPIC_BASE_URL" in os.environ:
+        relay_hits.append("env:自定义端点标记(值未读取)")
     if relay_hits:
+        relay_status = "WARN" if all("端点标记" in hit for hit in relay_hits) else "FAIL"
         checks.append(
             _make_check(
                 "claude_relay_harness",
-                "第三方中转站 / 本地转发桥 / 套壳 Harness 检测 (高危封号红线)",
-                "FAIL",
+                "第三方中转站 / 本地转发桥 / 套壳 Harness 标记",
+                relay_status,
                 f"命中 {len(relay_hits)} 项: {', '.join(relay_hits[:4])}",
-                "检测到非官方的 ANTHROPIC_BASE_URL、本地转发服务（如 127.0.0.1 端口桥接）或第三方切换/中转工具！Anthropic 明确严查在第三方中转/套壳工具中复用 Pro/Max OAuth 订阅凭据，极易直接触发 account_banned！",
+                "检测到自定义端点标记、apiKeyHelper 或第三方工具路径。地址值未读取，仅凭标记无法确认端点归属，请自行审阅配置来源。",
                 "使用官方订阅新号时，务必移除 settings.json 与环境变量中的自定义 ANTHROPIC_BASE_URL / apiKeyHelper，只直连官方 api.anthropic.com。",
                 severity="critical",
             )
         )
-        add_inv("Claude Code CLI", "中转站 / 本地转发配置", r"~/.claude/settings*.json · ~/.cc-switch · ~/.claude-code-router", "检测非官方 ANTHROPIC_BASE_URL 与 OAuth 套壳转发（高频封号诱因）", ", ".join(relay_hits[:4]), "FAIL")
+        add_inv("Claude Code CLI", "中转站 / 本地转发配置", r"~/.claude/settings*.json · ~/.cc-switch · ~/.claude-code-router", "检测非官方 ANTHROPIC_BASE_URL 与 OAuth 套壳转发（高频封号诱因）", ", ".join(relay_hits[:4]), relay_status)
     else:
         checks.append(
             _make_check(

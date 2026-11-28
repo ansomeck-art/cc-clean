@@ -3,7 +3,7 @@
 Region Guard — Local Cross-Platform (Windows / macOS) Region, Network Leak & Risk Audit Web Server.
 
 Pure Python 3.9+ standard library backend bound strictly to 127.0.0.1.
-Strictly read-only against OS, browser, proxy, and application state;
+Audits remain read-only; explicitly enabled macOS protection can terminate verified Claude Desktop processes;
 never reads or exposes secrets, tokens, passwords, or cookie values.
 """
 
@@ -12,13 +12,16 @@ import collections
 import concurrent.futures
 import datetime
 import email.utils
+import errno
 import http.server
+import ipaddress
 import json
 import locale
 import os
 import platform
 import plistlib
 import re
+import shlex
 import shutil
 import socket
 import sqlite3
@@ -30,6 +33,15 @@ import threading
 import time
 import urllib.parse
 import zlib
+import mac_platform
+from proxy_runtime import PaymentRouteObserver, payment_route_check
+from readonly_telemetry import ReadonlyTelemetryService, telemetry_filter_check
+from service_diagnostics import DIAGNOSTIC_KEYS, DIAGNOSTIC_LABELS, classify_http
+from client_version import ClaudeVersionObserver
+from traffic_watch import ClaudeTrafficWatch
+from native_connections import native_backend_available
+from protection import FastProtector
+from audit_common import count_log_tail, safe_parse_clash_yaml, safe_parse_surge_conf, inspect_telemetry
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
 IS_WINDOWS = sys.platform == "win32"
@@ -85,11 +97,50 @@ WHOIS_BIN = ("/usr/bin/whois" if IS_MACOS and os.path.isfile("/usr/bin/whois") e
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 RESOURCE_DIR = getattr(sys, "_MEIPASS", BASE_DIR)
 RUNTIME_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else BASE_DIR
+
+
+def _resolve_user_data_dir() -> str:
+    if IS_MACOS:
+        path = os.path.expanduser("~/Library/Application Support/RegionGuard")
+    elif IS_WINDOWS:
+        path = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "RegionGuard")
+    else:
+        path = os.path.expanduser("~/.local/share/region-guard")
+    override = os.environ.get("REGIONGUARD_DATA_DIR")
+    if override:
+        path = os.path.abspath(override)
+        name = os.path.basename(path)
+        if (not os.path.isabs(override) or not (name == "RegionGuard" or name.startswith("regionguard-test-"))
+                or ".app/" in (os.path.realpath(path) + "/").lower() or os.path.islink(path)):
+            raise ValueError("invalid private RegionGuard data directory")
+    uid = str(os.getuid()) if hasattr(os, "getuid") else str(os.getpid())
+    fallback = os.path.join(tempfile.gettempdir(), "region-guard-" + uid)
+    for candidate in ((path,) if override else (path, fallback)):
+        try:
+            if ".app/" in os.path.realpath(candidate) + "/" or os.path.islink(candidate):
+                continue
+            os.makedirs(candidate, mode=0o700, exist_ok=True)
+            if not IS_WINDOWS:
+                if os.stat(candidate).st_uid != os.getuid():
+                    continue
+                os.chmod(candidate, 0o700)
+            return candidate
+        except OSError:
+            continue
+    raise RuntimeError("无法创建 RegionGuard 私有运行目录")
+
+
+USER_DATA_DIR = _resolve_user_data_dir()
+TELEMETRY_SERVICE = ReadonlyTelemetryService(USER_DATA_DIR)
+CLIENT_VERSION = ClaudeVersionObserver(USER_DATA_DIR)
+CLAUDE_TRAFFIC = ClaudeTrafficWatch(interval_ms=500)
 STATIC_DIR = os.path.join(RESOURCE_DIR, "static")
 ALLOWED_STATIC = {
     "index.html": "text/html; charset=utf-8",
     "style.css": "text/css; charset=utf-8",
     "app.js": "application/javascript; charset=utf-8",
+    "fingerprint-checks.js": "application/javascript; charset=utf-8",
+    "locale-checks.js": "application/javascript; charset=utf-8",
 }
 
 RESTRICTED_COUNTRIES = {"CN", "HK", "MO", "RU", "BY", "KP", "IR", "CU", "SY"}
@@ -136,6 +187,8 @@ CLAUDE_RISK_DOMAINS = (
     "hcaptcha.com",
     "stripe.com",
     "stripe.network",
+    "assets.claude.ai", "bridge.claudeusercontent.com", "config.claude.com",
+    "pivot.claude.ai", "browser-intake-us5-datadoghq.com", "sentry.io", "statsig.com",
 )
 CN_DNS_SERVERS = {
     "114.114.114.114",
@@ -243,9 +296,15 @@ TARGETS: Dict[str, Dict[str, Any]] = {
 }
 
 
-PULSE_LOG_PATH = os.path.join(RUNTIME_DIR, "pulse-events.jsonl")
+PULSE_LOG_PATH = os.path.join(USER_DATA_DIR, "pulse-events.jsonl")
+PREFS_PATH = os.path.join(USER_DATA_DIR, "prefs.json")
+RUNTIME_INFO_PATH = os.path.join(USER_DATA_DIR, "runtime.json")
+LOCK_FILE_PATH = os.path.join(USER_DATA_DIR, "instance.lock")
+SHUTDOWN_EVENT = threading.Event()
+_COMMAND_LOCK = threading.Lock()
+_ACTIVE_COMMANDS = set()
 HISTORY_LOCK = threading.Lock()
-PULSE_HISTORY: Deque[Dict[str, Any]] = collections.deque(maxlen=200)
+PULSE_HISTORY: Deque[Dict[str, Any]] = collections.deque(maxlen=500)
 BASELINE_IP: Optional[str] = None
 
 
@@ -271,29 +330,63 @@ def _decode_cmd_bytes(raw: bytes) -> str:
     return raw.decode(enc, errors="replace")
 
 
-def run_cmd(cmd: List[str], timeout: int = 8) -> Tuple[int, str, str]:
+def shutdown_observers():
+    """Stop only subprocesses launched by RegionGuard; never other applications."""
+    SHUTDOWN_EVENT.set()
+    TELEMETRY_SERVICE.stop()
+    CLAUDE_TRAFFIC.stop()
+    with _COMMAND_LOCK:
+        commands = tuple(_ACTIVE_COMMANDS)
+    for command in commands:
+        try:
+            command.terminate()
+        except OSError:
+            pass
+
+
+def run_cmd(cmd: List[str], timeout: int = 8, env=None) -> Tuple[int, str, str]:
+    command = None
+    if SHUTDOWN_EVENT.is_set():
+        return 124, "", "RegionGuard closing"
     try:
-        kwargs: Dict[str, Any] = {
-            "stdout": subprocess.PIPE,
-            "stderr": subprocess.PIPE,
-            "timeout": timeout,
-        }
+        if env is None and cmd and os.path.basename(cmd[0]).lower() in {"curl", "curl.exe"}:
+            env = {k: v for k, v in os.environ.items() if k.lower() not in
+                   {"http_proxy", "https_proxy", "all_proxy", "no_proxy"}}
+        kwargs = dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
         if IS_WINDOWS:
             kwargs["creationflags"] = CREATE_NO_WINDOW
-        proc = subprocess.run(cmd, **kwargs)
-        return proc.returncode, _decode_cmd_bytes(proc.stdout), _decode_cmd_bytes(proc.stderr)
-    except subprocess.TimeoutExpired:
-        return 124, "", "timeout"
-    except Exception as exc:
-        return 1, "", str(exc)
+        command = subprocess.Popen(cmd, **kwargs)
+        with _COMMAND_LOCK:
+            _ACTIVE_COMMANDS.add(command)
+            if SHUTDOWN_EVENT.is_set():
+                command.terminate()
+        try:
+            stdout, stderr = command.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            command.kill()
+            command.communicate()
+            return 124, "", "timeout"
+        return command.returncode, _decode_cmd_bytes(stdout), _decode_cmd_bytes(stderr)
+    except Exception:
+        return 1, "", "command unavailable"
+    finally:
+        if command is not None:
+            with _COMMAND_LOCK:
+                _ACTIVE_COMMANDS.discard(command)
+
 
 
 def _curl_base_cmd(timeout: int) -> List[str]:
-    cmd = [CURL_BIN, "-sS", "--max-time", str(timeout)]
+    cmd = [CURL_BIN, "-q", "-sS", "--max-time", str(timeout)]
     if IS_WINDOWS:
         # Avoid Windows Schannel online CRL/OCSP revocation stalls behind proxies (keeps full TLS cert verification)
         cmd.append("--ssl-no-revoke")
     return cmd
+
+
+def _network_env():
+    return {k: v for k, v in os.environ.items() if k.lower() not in
+            {"http_proxy", "https_proxy", "all_proxy", "no_proxy"}}
 
 
 def curl_fetch(
@@ -310,7 +403,7 @@ def curl_fetch(
         cmd.append("-I")
     cmd.append(url)
     t0 = time.monotonic()
-    rc, out, err = run_cmd(cmd, timeout=timeout + 2)
+    rc, out, err = run_cmd(cmd, timeout=timeout + 2, env=_network_env())
     ms = round((time.monotonic() - t0) * 1000.0, 1)
     if rc != 0:
         return False, "", ms, (err.strip() or f"curl exit {rc}")
@@ -371,41 +464,12 @@ def make_check(
 
 
 def _check_utun_status() -> Tuple[bool, List[str], List[str], List[str]]:
-    """Inspect active utun interfaces, default routes, and IPv6 addresses."""
-    _, ifc_out, _ = run_cmd(["/sbin/ifconfig"], timeout=4)
-    _, route_out, _ = run_cmd(["/usr/sbin/netstat", "-rn"], timeout=4)
+    details = mac_platform.mac_check_tun_details(run_cmd)
+    return details["tun_up"], details["tun_ips"], details["default_routes"], details["global_v6"]
 
-    utun_ips: List[str] = []
-    global_v6: List[str] = []
-    cur_iface = ""
-    for line in ifc_out.splitlines():
-        m_iface = re.match(r"^([a-z0-9]+):", line)
-        if m_iface:
-            cur_iface = m_iface.group(1)
-        elif cur_iface.startswith("utun") and "\tinet " in line:
-            parts = line.split()
-            if len(parts) >= 2:
-                utun_ips.append(f"{cur_iface}: {parts[1]}")
-        elif "\tinet6 " in line and cur_iface != "lo0":
-            parts = line.split()
-            if len(parts) >= 2:
-                addr = parts[1].split("%")[0]
-                if not addr.startswith(("fe80:", "::1")):
-                    global_v6.append(f"{cur_iface}: {addr}")
 
-    default_routes: List[str] = []
-    for line in route_out.splitlines():
-        if line.startswith("default ") or line.startswith("::/0"):
-            cols = line.split()
-            if cols:
-                iface = cols[-1]
-                gw = cols[1] if len(cols) > 1 else ""
-                default_routes.append(f"{cols[0]} -> {gw} ({iface})")
-
-    utun_up = any("utun" in r for r in default_routes) or any(
-        "198.18." in u for u in utun_ips
-    )
-    return utun_up, utun_ips, default_routes, global_v6
+def _check_macos_ipv6_disabled() -> Dict[str, Any]:
+    return mac_platform.check_ipv6_disabled(run_cmd)
 
 
 # ---------------------------------------------------------------------------
@@ -742,7 +806,7 @@ def _query_rdap(ip: str) -> Dict[str, Any]:
 def _doh_query(name: str, qtype: str = "A", timeout: int = 5) -> Tuple[bool, Dict[str, Any]]:
     url = f"https://cloudflare-dns.com/dns-query?name={urllib.parse.quote(name)}&type={urllib.parse.quote(qtype)}"
     cmd = _curl_base_cmd(timeout) + ["-H", "Accept: application/dns-json", url]
-    rc, out, _ = run_cmd(cmd, timeout=timeout + 2)
+    rc, out, _ = run_cmd(cmd, timeout=timeout + 2, env=_network_env())
     if rc != 0 or not out.strip():
         return False, {}
     try:
@@ -834,13 +898,13 @@ def _query_edns_reliable() -> Tuple[bool, Any, float, str]:
 def _probe_third_party(name: str, url: str, category: str = "risk") -> Dict[str, Any]:
     cmd = _curl_base_cmd(8) + ["-o", os.devnull, "-w", "%{http_code}|%{redirect_url}", "-I", url]
     t0 = time.monotonic()
-    rc, out, err = run_cmd(cmd, timeout=10)
+    rc, out, err = run_cmd(cmd, timeout=10, env=_network_env())
     ms = round((time.monotonic() - t0) * 1000.0, 1)
     parts = out.strip().split("|", 1)
     code_str = parts[0] if parts else ""
     redir = parts[1] if len(parts) > 1 else ""
     ok = rc == 0 and code_str.isdigit() and 200 <= int(code_str) < 500
-    return {
+    result = {
         "name": name,
         "url": url,
         "domain": urllib.parse.urlparse(url).netloc,
@@ -851,6 +915,16 @@ def _probe_third_party(name: str, url: str, category: str = "risk") -> Dict[str,
         "ok": ok,
         "error": "" if ok else (err.strip() or f"HTTP {code_str or rc}"),
     }
+    if category == "legacy" and not ok:
+        # Fake-IP resolves even retired names locally. Check public DNS before
+        # attributing a legacy host's TLS failure to the user's payment route.
+        dns_ok, dns, _, _ = curl_json("https://dns.google/resolve?" + urllib.parse.urlencode(
+            {"name": result["domain"], "type": "A"}), timeout=5)
+        retired = bool(dns_ok and isinstance(dns, dict) and dns.get("Status") == 3)
+        result.update(status="INFO" if retired else "WARN", retired=retired,
+                      note="公共 DNS 返回 NXDOMAIN；旧版辅助域名，不计为支付故障" if retired
+                      else "旧版辅助域名不可达；未确认停用，保留排查提示")
+    return result
 
 
 def _probe_claude_edge_redirect() -> Dict[str, Any]:
@@ -863,33 +937,124 @@ def _probe_claude_edge_redirect() -> Dict[str, Any]:
         "https://claude.ai/login",
     ]
     t0 = time.monotonic()
-    rc, out, err = run_cmd(cmd, timeout=10)
+    rc, out, err = run_cmd(cmd, timeout=10, env=_network_env())
     ms = round((time.monotonic() - t0) * 1000.0, 1)
     hdrs, _, meta = out.rpartition("\n__RG_META__")
     parts = meta.strip().split("|", 1)
     code_str = parts[0] if parts else ""
     redir = parts[1] if len(parts) > 1 else ""
-    cf_challenge = "cf-mitigated: challenge" in hdrs.lower()
-    region_redir = "app-unavailable-in-region" in redir.lower()
-    blocked = region_redir or (code_str == "403" and not cf_challenge)
-    ok = rc == 0 and code_str.isdigit() and 200 <= int(code_str) < 500 and not blocked
+    code = int(code_str) if code_str.isdigit() else None
+    diagnostic = classify_http(status=code, headers=hdrs,
+                              request_url='https://claude.ai/login',
+                              error='timeout' if rc == 28 else 'network_error' if rc else None)
+    reasons = diagnostic['reason_codes']
+    cf_challenge = 'edge_challenge' in reasons
+    blocked = 'region_denied' in reasons
+    ok = rc == 0 and code is not None and 200 <= code < 400 and not blocked and not cf_challenge
     return {
         "name": "Claude Login Edge",
         "url": "https://claude.ai/login",
         "domain": "claude.ai/login",
         "category": "edge",
-        "http_code": int(code_str) if code_str.isdigit() else 0,
-        "redirect_url": redir,
+        "http_code": code or 0,
+        "redirect_url": '/app-unavailable-in-region' if blocked else '',
         "blocked": blocked,
         "cf_challenge": cf_challenge,
         "latency_ms": ms,
         "ok": ok,
-        "error": (
-            "redirected to app-unavailable-in-region"
-            if region_redir
-            else ("HTTP 403 (non-challenge)" if blocked else ("" if ok else (err.strip() or f"HTTP {code_str or rc}")))
-        ),
+        "diagnostic": diagnostic,
+        "error": '、'.join(DIAGNOSTIC_LABELS[reason] for reason in reasons) if reasons else
+                 ('' if ok else '公开登录入口未获可确认响应'),
     }
+
+
+def edge_gate_check(edge):
+    """A bare 403 cannot establish region rejection or an account ban."""
+    diagnostic = edge.get('diagnostic') or {}
+    codes = [key for key in DIAGNOSTIC_KEYS if key in diagnostic.get('reason_codes', [])]
+    if edge.get('blocked'):
+        return make_check('claude_edge_gate', 'Claude 公开登录入口响应分类', 'WARN',
+                          '观察到明确地区拒绝',
+                          '公开无凭据探测出现明确地区拒绝标识；这不是账号封禁或国籍判定。',
+                          '核对当前出口与服务支持范围；保留客户端标识和 Cookie。', severity='high')
+    if edge.get('cf_challenge'):
+        return make_check('claude_edge_gate', 'Claude 公开登录入口响应分类', 'INFO',
+                          'Cloudflare 人机验证',
+                          'cf-mitigated: challenge 仅证明此公开探测遇到挑战；实际登录需在真实浏览器确认。',
+                          severity='low')
+    if codes:
+        return make_check('claude_edge_gate', 'Claude 公开登录入口响应分类', 'WARN',
+                          '、'.join(DIAGNOSTIC_LABELS[key] for key in codes),
+                          '响应原因与地区拒绝、权限/IP 限制、人机验证及网络故障分开记录。'
+                          '普通 403 原因未确认，不判封号，不清理 ant-did 或 Cookie。', severity='low')
+    if not edge.get('ok'):
+        return make_check('claude_edge_gate', 'Claude 公开登录入口响应分类', 'WARN',
+                          '公开探测未获确认', '当前响应不足以推断账号或地区状态。', severity='low')
+    return make_check('claude_edge_gate', 'Claude 公开登录入口响应分类', 'INFO',
+                      '公开入口可响应', '只验证无凭据入口响应，不证明真实客户端登录或账号权限正常。')
+
+
+def service_response_check(telemetry):
+    counts = dict.fromkeys(DIAGNOSTIC_KEYS, 0)
+    for source in telemetry.get('sources', []):
+        if isinstance(source, dict) and source.get('id') == 'claude_logs':
+            values = source.get('diagnostics', {})
+            if isinstance(values, dict):
+                counts = {key: value if type(value := values.get(key)) is int and 0 <= value < 2**63 else 0
+                          for key in DIAGNOSTIC_KEYS}
+    total = sum(counts.values())
+    return make_check('service_response_diagnostics', 'Claude 服务拒绝与网络错误分类',
+                      'WARN' if total else 'INFO',
+                      ' · '.join(DIAGNOSTIC_LABELS[key] + ' ' + str(counts[key]) for key in DIAGNOSTIC_KEYS),
+                      '仅为本次文件观察窗口内的分类计数，未解密上传或读取响应正文。'
+                      '403 未知不等于地区限制或封号；零计数不证明账号安全，不建议清理安装标识。',
+                      severity='low')
+
+
+def client_version_check(snapshot):
+    current = snapshot.get('current_version', '')
+    version = current if isinstance(current, str) and re.fullmatch(r'[0-9]{1,10}(?:\.[0-9]{1,10}){1,4}', current) else ''
+    changed = snapshot.get('review_required') is True
+    return make_check('client_version_review', 'Claude 版本变化复核提醒', 'WARN' if changed else 'INFO',
+                      ('检测到版本变化，请复核只读检查范围' if changed else
+                       '当前安装版本 ' + version if version else '安装版本未获确认'),
+                      '只读取已知应用的版本元数据；版本变化仅提醒，不触发强退、不读队列正文。'
+                      '安装版本不等于当前正在运行的进程版本。', severity='low')
+
+
+def traffic_coverage_check(snapshot):
+    state = snapshot.get('state')
+    route = snapshot.get('route_evidence') or {}
+    groups = snapshot.get('groups', [])
+    counts = dict(socket=0, matched=0, proxy=0, direct=0, unknown=0, route_bypass=0)
+    for group in groups if isinstance(groups, list) else []:
+        if not isinstance(group, dict) or group.get('id') not in {'ClaudeDesktop', 'ClaudeHelper'}:
+            continue
+        def number(value):
+            return value if type(value) is int and 0 <= value <= 2**31 else 0
+        counts['socket'] += number(group.get('socket_count'))
+        counts['matched'] += number(group.get('matched_count'))
+        transports = group.get('transport_counts') or {}
+        if isinstance(transports, dict):
+            for key in ('proxy', 'direct', 'unknown'):
+                counts[key] += number(transports.get(key))
+        route_counts = group.get('route_counts') or {}
+        if isinstance(route_counts, dict):
+            counts['route_bypass'] += number(route_counts.get('physical_bypass'))
+    def flag(name):
+        return '已观察' if route.get(name) is True else '未启用' if route.get(name) is False else '未知'
+    return make_check('claude_traffic_coverage', 'Claude 实际连接的只读覆盖证据',
+                      'WARN' if counts['direct'] or counts['route_bypass'] else 'INFO',
+                      '发现公网目的地址的物理路由例外' if counts['route_bypass'] else
+                      '客户端未运行，暂无连接证据' if state == 'not_running' else
+                      '已观察到部分连接元数据，全部覆盖未验证' if state == 'observed' else '连接证据未获确认',
+                      'TUN ' + flag('tun_enabled') + ' · Global ' + flag('global_mode') + '。'
+                      '当前 socket {socket} · 已匹配 {matched} · 代理 {proxy} · DIRECT {direct} · 未知 {unknown}。'.format(**counts) +
+                      '仅将已验证 Claude 进程的 socket 与代理连接元数据关联，不抓包、不解密 HTTPS。'
+                      'DIRECT 仅指控制器路由选择，不等于物理绕过或中国出口。'
+                      '目的路由表证据不等于逐包实际接口证明。'
+                      '未匹配连接保留未知；配置模式、路由与当前样本不能证明所有遥测或未来连接均经过代理。',
+                      severity='high' if counts['route_bypass'] else 'low')
 
 
 def _ntp_probe(host: str = "", port: int = 123) -> Dict[str, Any]:
@@ -934,6 +1099,11 @@ def _trace_domain(domain: str) -> Dict[str, Any]:
             "error": err,
         }
     parsed = parse_cf_trace(body)
+    try:
+        trace_available = bool(ipaddress.ip_address(parsed.get("ip", "")).is_global and
+                               re.fullmatch(r"[A-Z]{2}", parsed.get("loc", "")))
+    except ValueError:
+        trace_available = False
     return {
         "domain": domain,
         "ip": parsed.get("ip", ""),
@@ -945,8 +1115,10 @@ def _trace_domain(domain: str) -> Dict[str, Any]:
         "gateway": parsed.get("gateway", "off"),
         "sni": parsed.get("sni", ""),
         "latency_ms": ms,
-        "ok": True,
-        "error": "",
+        "ok": trace_available,
+        "reachable": True,
+        "trace_available": trace_available,
+        "error": "" if trace_available else "HTTP 可达，但未提供 Cloudflare trace，出口未核验",
     }
 
 
@@ -962,6 +1134,10 @@ def _check_split_dns_resolution() -> Dict[str, Any]:
         "downloads.claude.ai",
         "releases.claude.com",
         "assets.claude.ai",
+        "bridge.claudeusercontent.com",
+        "config.claude.com",
+        "pivot.claude.ai",
+        "browser-intake-us5-datadoghq.com",
         "www.claudeusercontent.com",
         "sandbox.claudemcpcontent.com",
         "statsig.anthropic.com",
@@ -980,6 +1156,8 @@ def _check_split_dns_resolution() -> Dict[str, Any]:
         return ip.startswith(("198.18.", "198.19."))
 
     for dom in domains:
+        if SHUTDOWN_EVENT.is_set():
+            break
         try:
             infos = socket.getaddrinfo(dom, 443, socket.AF_INET, socket.SOCK_STREAM)
             ip = infos[0][4][0] if infos else ""
@@ -1132,2452 +1310,42 @@ def _check_dns_and_proxy_scutil() -> Dict[str, Any]:
 # Category 3: Clash / VPN Sanitized Config Inspection
 # ---------------------------------------------------------------------------
 def _safe_parse_clash_yaml(path: str) -> Dict[str, Any]:
-    """Extract only non-secret fields (mode, dns, tun, ipv6, listeners, risk DIRECT rules, group names)."""
-    result: Dict[str, Any] = {
-        "exists": False,
-        "mode": "",
-        "ipv6": None,
-        "dns_enable": None,
-        "dns_enhanced_mode": "",
-        "dns_nameserver": [],
-        "dns_default_nameserver": [],
-        "dns_proxy_server_nameserver": [],
-        "dns_fallback": [],
-        "tun_enable": None,
-        "tun_stack": "",
-        "tun_strict_route": None,
-        "tun_auto_route": None,
-        "tun_auto_detect_interface": None,
-        "fakeip_risk_filters": [],
-        "direct_risk_rules": [],
-        "process_direct_risks": [],
-        "reject_risk_rules": [],
-        "proxy_groups": [],
-        "direct_listeners": [],
-        "prepend_direct_count": 0,
-    }
-    if not os.path.isfile(path):
-        return result
-    result["exists"] = True
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            lines = f.read().splitlines()
-    except Exception:
-        return result
+    return safe_parse_clash_yaml(path)
 
-    risk_rule_kw = (
-        "claude",
-        "anthropic",
-        "claudeusercontent",
-        "claudemcpcontent",
-        "stripe",
-        "hcaptcha",
-        "cloudflare",
-        "statsig",
-        "sentry",
-        "datadog",
-    )
-    proc_sub_kw = ("claude", "cowork", "anthropic", "node", "ssh", "git", "curl")
-    top_sec = ""
-    sub_sec = ""
-    base_indent = -1
-    for line in lines:
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        indent = len(line) - len(line.lstrip())
-        s = line.strip()
-        low = s.lower()
-        # Never touch secret/credential/node-server lines
-        if re.match(r"^(?:-\s*)?(secret|password|token|uuid|server|private-key|url)\s*:", low):
-            continue
-        if indent == 0 and ":" in s and not s.startswith("-"):
-            k, v = s.split(":", 1)
-            top_sec = k.strip()
-            sub_sec = ""
-            base_indent = -1
-            val = v.strip().strip('"').strip("'")
-            if top_sec == "mode" and val:
-                result["mode"] = val
-            elif top_sec == "ipv6" and val:
-                result["ipv6"] = val.lower() == "true"
-            continue
-        if top_sec in {"proxies", "proxy-providers"}:
-            continue
 
-        if top_sec == "dns":
-            if ":" in s and not s.startswith("-"):
-                k, v = s.split(":", 1)
-                k = k.strip()
-                val = v.strip().strip('"').strip("'")
-                if k == "enable" and val:
-                    result["dns_enable"] = val.lower() == "true"
-                    sub_sec = ""
-                elif k == "enhanced-mode" and val:
-                    result["dns_enhanced_mode"] = val
-                    sub_sec = ""
-                elif k in {"nameserver", "default-nameserver", "proxy-server-nameserver", "fallback", "fake-ip-filter"}:
-                    sub_sec = k
-                else:
-                    sub_sec = ""
-            elif s.startswith("-") and sub_sec:
-                val = s[1:].strip().strip('"').strip("'")
-                if sub_sec == "fake-ip-filter":
-                    if any(kw in val.lower() for kw in risk_rule_kw) and len(result["fakeip_risk_filters"]) < 8:
-                        result["fakeip_risk_filters"].append(val[:64])
-                else:
-                    key_map = {
-                        "nameserver": "dns_nameserver",
-                        "default-nameserver": "dns_default_nameserver",
-                        "proxy-server-nameserver": "dns_proxy_server_nameserver",
-                        "fallback": "dns_fallback",
-                    }
-                    if sub_sec in key_map and val:
-                        result[key_map[sub_sec]].append(val)
-        elif top_sec == "tun":
-            if ":" in s and not s.startswith("-"):
-                k, v = s.split(":", 1)
-                k = k.strip()
-                val = v.strip().strip('"').strip("'")
-                if k == "enable" and val:
-                    result["tun_enable"] = val.lower() == "true"
-                elif k == "stack" and val:
-                    result["tun_stack"] = val
-                elif k == "strict-route" and val:
-                    result["tun_strict_route"] = val.lower() == "true"
-                elif k == "auto-route" and val:
-                    result["tun_auto_route"] = val.lower() == "true"
-                elif k == "auto-detect-interface" and val:
-                    result["tun_auto_detect_interface"] = val.lower() == "true"
-        elif top_sec == "rules":
-            if s.startswith("-"):
-                val = s[1:].strip().strip('"').strip("'")
-                if "direct" in low:
-                    if low.lstrip("- ").startswith(("process-name,", "process-path,")) and any(pk in low for pk in proc_sub_kw):
-                        if len(result["process_direct_risks"]) < 8:
-                            result["process_direct_risks"].append(val[:72])
-                    elif any(kw in low for kw in risk_rule_kw):
-                        if len(result["direct_risk_rules"]) < 8:
-                            result["direct_risk_rules"].append(val[:72])
-                elif "reject" in low and any(kw in low for kw in risk_rule_kw):
-                    if len(result["reject_risk_rules"]) < 8:
-                        result["reject_risk_rules"].append(val[:72])
-        elif top_sec == "proxy-groups":
-            if s.startswith("- name:") or s.startswith("name:"):
-                val = s.split(":", 1)[1].strip().strip('"').strip("'")
-                if val:
-                    result["proxy_groups"].append(val)
-        elif top_sec == "listeners":
-            if s.startswith("- "):
-                base_indent = indent
-                result["direct_listeners"].append({})
-                rest = s[2:].strip()
-                if ":" in rest:
-                    k, v = rest.split(":", 1)
-                    if k.strip() in {"name", "port", "proxy", "type"}:
-                        result["direct_listeners"][-1][k.strip()] = v.strip().strip('"')
-            elif result["direct_listeners"] and indent > base_indent and ":" in s:
-                k, v = s.split(":", 1)
-                if k.strip() in {"name", "port", "proxy", "type"}:
-                    result["direct_listeners"][-1][k.strip()] = v.strip().strip('"')
-        elif top_sec == "x-clash-rule-index":
-            if s.startswith("prepend:"):
-                sub_sec = "prepend"
-            elif sub_sec == "prepend" and s.startswith("- ") and "DIRECT" in s:
-                result["prepend_direct_count"] += 1
+def _safe_parse_surge_conf(path: str) -> Dict[str, Any]:
+    return safe_parse_surge_conf(path)
 
-    return result
+
+def _safe_sqlite_query(path: str, sql: str):
+    return mac_platform._safe_sqlite_query(path, sql)
 
 
 def audit_clash_proxy() -> Dict[str, Any]:
-    checks: List[Dict[str, str]] = []
-    _, ps_out, _ = run_cmd(["/bin/ps", "-axo", "comm"], timeout=4)
-    proxy_procs = sorted(
-        {
-            line.strip()
-            for line in ps_out.splitlines()
-            if re.search(
-                r"clash|mihomo|surge|sing-box|v2ray|xray|shadowrocket|stash|loon|tailscale|wireguard",
-                line,
-                re.I,
-            )
-        }
-    )
-    _, nc_out, _ = run_cmd(["/usr/sbin/scutil", "--nc", "list"], timeout=4)
-    connected_vpns = [
-        line.strip() for line in nc_out.splitlines() if "(Connected)" in line
-    ]
-
-    checks.append(
-        make_check(
-            "proxy_process",
-            "代理 / VPN 运行状态",
-            "PASS" if (proxy_procs or connected_vpns) else "WARN",
-            f"进程 {len(proxy_procs)} 个; 已连接 VPN {len(connected_vpns)} 个",
-            f"运行进程: {', '.join(proxy_procs) if proxy_procs else '无'}；已连接服务: {', '.join(connected_vpns) if connected_vpns else '无'}",
-            "" if (proxy_procs or connected_vpns) else "请确认代理客户端已启动并连接。",
-        )
-    )
-
-    active_yaml = os.path.expanduser(
-        "~/Library/Group Containers/group.com.hako.network/working/active/config.yaml"
-    )
-    parsed = _safe_parse_clash_yaml(active_yaml)
-    if parsed["exists"]:
-        mode = parsed["mode"] or "unknown"
-        if mode.lower() == "global":
-            m_status = "PASS"
-            m_detail = "当前为 Global 全局模式，所有流量统一走选定节点。"
-            m_fix = ""
-        elif mode.lower() == "rule":
-            m_status = "WARN"
-            m_detail = "当前为 Rule 规则模式，若分流规则遗漏或 DNS 回落本地，可能走直连泄露。"
-            m_fix = "在访问敏感服务或排查风控时建议切为 Global，或严格核对 Anthropic/Stripe/hCaptcha 规则。"
-        else:
-            m_status = "FAIL"
-            m_detail = f"当前模式为 {mode}，存在直连泄露风险。"
-            m_fix = "在 Clash 客户端将模式切换为 Global 或严格的 Rule 模式。"
-        checks.append(make_check("clash_mode", "Clash 代理模式", m_status, mode, m_detail, m_fix))
-
-        ns_all = (
-            parsed["dns_nameserver"]
-            + parsed["dns_default_nameserver"]
-            + parsed["dns_proxy_server_nameserver"]
-        )
-        has_system_dns = any(x.lower() == "system" for x in ns_all)
-        dns_desc = (
-            f"enhanced-mode={parsed['dns_enhanced_mode'] or '-'}, "
-            f"nameserver={parsed['dns_nameserver'] or ['-']}, "
-            f"default={parsed['dns_default_nameserver'] or ['-']}"
-        )
-        if has_system_dns:
-            checks.append(
-                make_check(
-                    "clash_dns",
-                    "Clash 内置 DNS 配置",
-                    "WARN",
-                    "包含 system DNS",
-                    f"{dns_desc}。当前虽开了 fake-ip，但底层仍引用 system（即本机路由器 DNS），一旦切回 Rule 模式或断开瞬间会向本地路由器发起解析。",
-                    "在 Clash 客户端设置中将 nameserver / default-nameserver 从 system 改为海外加密 DNS（如 https://1.1.1.1/dns-query 或 https://8.8.8.8/dns-query）。",
-                )
-            )
-        else:
-            checks.append(
-                make_check(
-                    "clash_dns",
-                    "Clash 内置 DNS 配置",
-                    "PASS",
-                    dns_desc,
-                    "未引用本地 system DNS，已使用独立上游 DNS。",
-                )
-            )
-
-        direct_risk_rules = parsed.get("direct_risk_rules") or []
-        fakeip_risk_filters = parsed.get("fakeip_risk_filters") or []
-        proc_direct_risks = parsed.get("process_direct_risks") or []
-        reject_risk_rules = parsed.get("reject_risk_rules") or []
-        if direct_risk_rules or fakeip_risk_filters:
-            checks.append(
-                make_check(
-                    "clash_direct_risk_rules",
-                    "Clash 规则与 Fake-IP 放行冲突",
-                    "FAIL",
-                    f"DIRECT 命中 {len(direct_risk_rules)} 条 | fake-ip-filter 命中 {len(fakeip_risk_filters)} 条",
-                    f"检测到放行 Claude/风控/遥测域名的规则: {', '.join((direct_risk_rules + fakeip_risk_filters)[:5])}",
-                    "移除 anthropic / claude / claudeusercontent / stripe / hcaptcha / statsig / sentry / datadog / cloudflare 相关的 DIRECT 或 fake-ip-filter 条目。",
-                    severity="critical",
-                )
-            )
-        if proc_direct_risks:
-            is_claude_proc_direct = any(
-                any(k in r.lower() for k in ("claude", "cowork", "anthropic")) for r in proc_direct_risks
-            )
-            checks.append(
-                make_check(
-                    "clash_process_direct",
-                    "Clash 进程级直连规则误伤检测 (PROCESS-NAME)",
-                    "FAIL" if is_claude_proc_direct else "WARN",
-                    f"命中 {len(proc_direct_risks)} 条进程直连规则: {', '.join(proc_direct_risks[:4])}",
-                    "Claude Desktop 会拉起 Cowork VM、SSH Proxy、内置 Node 与 Git 子进程；将这些进程设为 DIRECT 会导致后台请求绕过代理直连本地宽带！",
-                    "从 Clash rules 中移除针对 claude / cowork / node / ssh / git / curl 的 PROCESS-NAME DIRECT 规则。",
-                    severity="critical" if is_claude_proc_direct else "high",
-                )
-            )
-        if reject_risk_rules:
-            crit_reject = [
-                r for r in reject_risk_rules
-                if any(k in r.lower() for k in ("claude", "anthropic", "stripe", "hcaptcha", "cloudflare", "statsig"))
-            ]
-            checks.append(
-                make_check(
-                    "clash_reject_telemetry",
-                    "Clash 风控/遥测域名 REJECT 拦截副作用检测",
-                    "FAIL" if crit_reject else "WARN",
-                    f"命中 {len(reject_risk_rules)} 条 REJECT 规则: {', '.join(reject_risk_rules[:4])}",
-                    (
-                        "致命误伤！拦截 claude / anthropic / stripe / hcaptcha / statsig 会直接破坏验证或支付！"
-                        if crit_reject
-                        else "对 Sentry / Datadog 遥测域名使用 REJECT 会导致客户端在 sentry/queue 积压离线包并累加 desktop_telemetry_upload_lost 失败上报计数，且拦不住第一方 claude.ai/api/v2/rum。"
-                    ),
-                    "切勿用 REJECT 硬拦相关域名；应统一走与 claude.ai 相同的代理出口，并改用官方环境变量（DISABLE_TELEMETRY=1 等）合规关闭非必要遥测。",
-                    severity="critical" if crit_reject else "low",
-                )
-            )
-
-        direct_l = [
-            f"{l.get('name', '?')}:{l.get('port', '?')}->{l.get('proxy', '?')}"
-            for l in parsed["direct_listeners"]
-            if l.get("proxy", "").upper() == "DIRECT"
-        ]
-        if direct_l or parsed["prepend_direct_count"] > 0:
-            checks.append(
-                make_check(
-                    "clash_direct_bypass",
-                    "Clash 直连监听与前置放行规则",
-                    "INFO",
-                    f"直连监听 {len(direct_l)} 个, 前置 DIRECT {parsed['prepend_direct_count']} 条",
-                    f"直连端口: {', '.join(direct_l) if direct_l else '无'}。请确认没有把浏览器/Claude 配置到直连监听端口。",
-                )
-            )
-    else:
-        checks.append(
-            make_check(
-                "clash_config_missing",
-                "Clash 配置文件探测",
-                "INFO",
-                "未发现 Clash working/active/config.yaml",
-                "若你使用的是其他代理客户端，这是正常的；可参考上方通道与 DNS 实测结果。",
-            )
-        )
-
-    profiles_json = os.path.expanduser(
-        "~/Library/Group Containers/group.com.hako.network/working/store/profiles.json"
-    )
-    if os.path.isfile(profiles_json):
-        try:
-            pdata = json.load(open(profiles_json, "r", encoding="utf-8"))
-            if isinstance(pdata, list):
-                prof_summaries: List[str] = []
-                risky_alt = False
-                for item in pdata:
-                    if not isinstance(item, dict):
-                        continue
-                    lbl = str(item.get("label") or item.get("id") or "?")
-                    smap = item.get("selectedMap") if isinstance(item.get("selectedMap"), dict) else {}
-                    g_pick = smap.get("GLOBAL", "-")
-                    if lbl.lower() == "direct" or g_pick in {"DIRECT", "PROXY", "AUTO"}:
-                        risky_alt = True
-                    prof_summaries.append(f"{lbl}(GLOBAL={g_pick})")
-                checks.append(
-                    make_check(
-                        "clash_profiles",
-                        "Clash 备用配置档检查",
-                        "WARN" if risky_alt else "INFO",
-                        f"共 {len(prof_summaries)} 个配置: {', '.join(prof_summaries[:6])}",
-                        "检测到 Direct 或含其他分流策略的备用配置档；切换配置档会导致节点或 DNS 瞬间回落。",
-                        "使用 Claude 期间请勿误切回 Direct 或未审计的备用配置。" if risky_alt else "",
-                    )
-                )
-        except Exception:
-            pass
-
-    return {"title": "代理与 Clash 配置 (脱敏)", "checks": checks}
-
-
-# ---------------------------------------------------------------------------
-# Category 4: macOS System Locale, Country, Timezone, Location, Hostname
-# ---------------------------------------------------------------------------
-def _read_system_country() -> str:
-    plist_path = "/Library/Preferences/.GlobalPreferences.plist"
-    try:
-        with open(plist_path, "rb") as f:
-            data = plistlib.load(f)
-            c = data.get("Country", "")
-            if c:
-                return str(c)
-    except Exception:
-        pass
-    rc, out, _ = run_cmd(["/usr/bin/defaults", "read", "/Library/Preferences/.GlobalPreferences", "Country"], timeout=4)
-    return out.strip() if rc == 0 else ""
-
-
-def _read_auto_timezone() -> Optional[bool]:
-    plist_path = "/Library/Preferences/com.apple.timezone.auto.plist"
-    try:
-        with open(plist_path, "rb") as f:
-            data = plistlib.load(f)
-            if "Active" in data:
-                return bool(data["Active"])
-    except Exception:
-        pass
-    rc, out, _ = run_cmd(["/usr/bin/defaults", "read", "/Library/Preferences/com.apple.timezone.auto", "Active"], timeout=4)
-    if rc == 0:
-        return out.strip() in {"1", "true", "YES"}
-    return None
+    result = mac_platform.mac_audit_proxy(run_cmd)
+    result['checks'].insert(0, telemetry_filter_check(TELEMETRY_SERVICE.status()))
+    if IS_MACOS:
+        result['checks'].append(service_response_check((MONITOR.status().get('protection') or {}).get('telemetry') or {}))
+        result['checks'].append(client_version_check(CLIENT_VERSION.sample()))
+        traffic = CLAUDE_TRAFFIC.status()
+        result['checks'].append(traffic_coverage_check(traffic.get('evidence') or {}))
+    return result
 
 
 def audit_macos_system(target_cfg: Dict[str, Any]) -> Dict[str, Any]:
-    checks: List[Dict[str, str]] = []
-    t_code = target_cfg["code"]
-
-    # 1. System-level Country
-    sys_country = _read_system_country()
-    if sys_country.upper() == t_code:
-        checks.append(make_check("sys_country", "系统级区域代码 (GlobalPreferences Country)", "PASS", sys_country, f"系统级区域已设置为 {t_code}。"))
-    elif sys_country.upper() in RESTRICTED_COUNTRIES:
-        checks.append(
-            make_check(
-                "sys_country",
-                "系统级区域代码 (GlobalPreferences Country)",
-                "FAIL",
-                sys_country,
-                f"系统级 /Library/Preferences/.GlobalPreferences.plist 中 Country 仍为 {sys_country}，与目标地区 {t_code} 冲突。",
-                f"在终端执行管理员命令改为 {t_code}。",
-                f'sudo defaults write /Library/Preferences/.GlobalPreferences Country -string "{t_code}"',
-                severity="high",
-            )
-        )
-    else:
-        checks.append(
-            make_check(
-                "sys_country",
-                "系统级区域代码 (GlobalPreferences Country)",
-                "WARN",
-                sys_country or "<unset>",
-                f"系统级 Country 为 {sys_country or '未设置'}，与目标 {t_code} 不一致。",
-                f"建议统一设置为 {t_code}。",
-                f'sudo defaults write /Library/Preferences/.GlobalPreferences Country -string "{t_code}"',
-                severity="high",
-            )
-        )
-
-    # 2. User AppleLocale & AppleLanguages
-    _, loc_out, _ = run_cmd(["/usr/bin/defaults", "read", "-g", "AppleLocale"], timeout=3)
-    _, lang_out, _ = run_cmd(["/usr/bin/defaults", "read", "-g", "AppleLanguages"], timeout=3)
-    user_locale = loc_out.strip()
-    langs = [x.strip(' ",()') for x in lang_out.splitlines() if x.strip(' ",()')]
-    primary_lang = langs[0] if langs else ""
-    if (user_locale in target_cfg["locales"] or user_locale.endswith(f"_{t_code}")) and not any(
-        x.lower().startswith("zh-cn") or x.lower().startswith("zh_cn") for x in langs
-    ):
-        checks.append(
-            make_check(
-                "user_locale",
-                "用户级语言与地区 (AppleLocale / AppleLanguages)",
-                "PASS",
-                f"{user_locale} / {', '.join(langs[:3])}",
-                "用户级系统区域与首选语言符合目标地区。",
-            )
-        )
-    else:
-        checks.append(
-            make_check(
-                "user_locale",
-                "用户级语言与地区 (AppleLocale / AppleLanguages)",
-                "WARN",
-                f"{user_locale or '?'} / {', '.join(langs[:3])}",
-                f"用户级地区或语言偏离目标 {t_code}（当前 {user_locale} / {primary_lang}）。",
-                "在 System Settings -> General -> Language & Region 调整首选语言与 Region。",
-            )
-        )
-
-    # 3. NSLinguisticDataAssetsRequested
-    _, ling_out, _ = run_cmd(["/usr/bin/defaults", "read", "-g", "NSLinguisticDataAssetsRequested"], timeout=3)
-    ling_items = [x.strip(' ",()') for x in ling_out.splitlines() if x.strip(' ",()')]
-    if any(x.lower().startswith("zh") for x in ling_items):
-        checks.append(
-            make_check(
-                "ling_assets",
-                "语言资源请求历史 (NSLinguisticDataAssetsRequested)",
-                "WARN",
-                ", ".join(ling_items),
-                "系统中留存了中文语言资源请求记录。",
-                "可执行命令清理为仅 en。",
-                'defaults write -g NSLinguisticDataAssetsRequested -array "en"',
-            )
-        )
-    else:
-        checks.append(
-            make_check(
-                "ling_assets",
-                "语言资源请求历史 (NSLinguisticDataAssetsRequested)",
-                "PASS",
-                ", ".join(ling_items) or "en",
-                "无中文语言资源请求残留。",
-            )
-        )
-
-    # 4. System Timezone & Stale Process Reboot Check
-    tz_link = ""
-    tz_mtime = 0.0
-    try:
-        tz_link = os.readlink("/etc/localtime")
-        tz_mtime = os.lstat("/etc/localtime").st_mtime
-    except Exception:
-        pass
-    tz_name = tz_link.split("/zoneinfo/")[-1] if "/zoneinfo/" in tz_link else tz_link
-    local_dt = datetime.datetime.now().astimezone()
-    offset_sec = int(local_dt.utcoffset().total_seconds()) if local_dt.utcoffset() else 0
-
-    _, boot_out, _ = run_cmd(["/usr/sbin/sysctl", "-n", "kern.boottime"], timeout=3)
-    boot_m = re.search(r"sec\s*=\s*(\d+)", boot_out)
-    boot_sec = int(boot_m.group(1)) if boot_m else 0
-
-    tz_is_restricted = tz_name in RESTRICTED_TIMEZONES
-    if tz_name:
-        tz_ok = (tz_name in target_cfg["timezones"]) and (not tz_is_restricted)
-    else:
-        tz_ok = offset_sec in target_cfg["utc_offsets_sec"]
-
-    if not tz_ok:
-        tz_sev = "critical" if tz_is_restricted else "high"
-        checks.append(
-            make_check(
-                "sys_timezone",
-                "系统时区 (/etc/localtime)",
-                "FAIL",
-                f"{tz_name or '未知'} (UTC{offset_sec/3600:+.1f})",
-                f"当前系统时区为 {tz_name or '未知'}，与目标地区 {target_cfg['name']} 不匹配（即使同为 UTC+8，Asia/Shanghai 也会被直接识别为中国区）。",
-                f"将系统时区改为 {target_cfg['timezones'][0]} 并重启。",
-                f"sudo systemsetup -settimezone {target_cfg['timezones'][0]}",
-                severity=tz_sev,
-            )
-        )
-    elif boot_sec and tz_mtime > boot_sec:
-        tz_changed_str = datetime.datetime.fromtimestamp(tz_mtime).strftime("%Y-%m-%d %H:%M")
-        boot_str = datetime.datetime.fromtimestamp(boot_sec).strftime("%Y-%m-%d %H:%M")
-        checks.append(
-            make_check(
-                "sys_timezone",
-                "系统时区与重启刷新状态",
-                "WARN",
-                f"{tz_name}（改于 {tz_changed_str}，上次开机 {boot_str}）",
-                "系统时区本身已是目标时区，但你修改时区后尚未重启 Mac；开机前启动的常驻进程仍可能缓存修改前的旧时区。",
-                "完成全部系统修改后完整重启一次 Mac，再打开 Claude 或浏览器。",
-                severity="high",
-            )
-        )
-    else:
-        checks.append(
-            make_check(
-                "sys_timezone",
-                "系统时区与重启刷新状态",
-                "PASS",
-                f"{tz_name} ({local_dt.strftime('%z')})",
-                "系统时区与目标一致，且自上次重启以来未再发生时区跳变。",
-            )
-        )
-
-    # 5. Auto Timezone
-    auto_tz = _read_auto_timezone()
-    if auto_tz is True:
-        checks.append(
-            make_check(
-                "auto_timezone",
-                "自动设置时区 (timezone.auto)",
-                "WARN",
-                "已开启 (Active = 1)",
-                "开启自动时区会依据物理位置/Wi-Fi 定位自动覆盖当前时区，唤醒或重连网络时有切回真实时区的风险。",
-                "关闭自动设置时区并锁定为目标时区。",
-                "sudo defaults write /Library/Preferences/com.apple.timezone.auto Active -bool false",
-                severity="high",
-            )
-        )
-    elif auto_tz is False:
-        checks.append(
-            make_check(
-                "auto_timezone",
-                "自动设置时区 (timezone.auto)",
-                "PASS",
-                "已关闭 (Active = 0)",
-                "已锁定手动时区，不会被位置服务自动覆盖。",
-            )
-        )
-    else:
-        checks.append(make_check("auto_timezone", "自动设置时区 (timezone.auto)", "INFO", "未知", "无法读取自动时区配置。"))
-
-    # 6. Location Services
-    _, loc_ps, _ = run_cmd(["/bin/ps", "-axo", "comm"], timeout=3)
-    loc_procs = [p.strip() for p in loc_ps.splitlines() if p.strip().endswith(("/locationd", "/com.apple.geod"))]
-    loc_enabled_pref = None
-    _, loc_pref_out, _ = run_cmd(
-        ["/usr/bin/defaults", "read", "/var/db/locationd/Library/Preferences/ByHost/com.apple.locationd", "LocationServicesEnabled"],
-        timeout=3,
-    )
-    if loc_pref_out.strip() in {"0", "1"}:
-        loc_enabled_pref = loc_pref_out.strip() == "1"
-
-    if loc_enabled_pref is False:
-        checks.append(make_check("location_services", "macOS 定位服务 (Wi-Fi 物理定位)", "PASS", "已关闭", "系统定位服务已关闭。"))
-    else:
-        checks.append(
-            make_check(
-                "location_services",
-                "macOS 定位服务 (Wi-Fi 物理定位)",
-                "WARN",
-                f"相关守护进程运行中 ({len(loc_procs)} 个)" if loc_procs else "状态未关闭（受 TCC 保护需手动核对）",
-                "macOS 定位依靠周边 Wi-Fi 物理信号（BSSID）测算位置，完全绕过代理隧道。",
-                "在 System Settings -> Privacy & Security -> Location Services 关闭定位服务，或至少关闭 Safari / Claude 及 System Services -> Setting Time Zone。",
-            )
-        )
-
-    # 7. Hostnames (ComputerName / LocalHostName / HostName / SMB NetBIOSName)
-    _, cn, _ = run_cmd(["/usr/sbin/scutil", "--get", "ComputerName"], timeout=3)
-    _, lhn, _ = run_cmd(["/usr/sbin/scutil", "--get", "LocalHostName"], timeout=3)
-    rc_hn, hn, _ = run_cmd(["/usr/sbin/scutil", "--get", "HostName"], timeout=3)
-    rc_smb, smb_nb, _ = run_cmd(
-        ["/usr/bin/defaults", "read", "/Library/Preferences/SystemConfiguration/com.apple.smb.server", "NetBIOSName"],
-        timeout=3,
-    )
-    cn = cn.strip()
-    lhn = lhn.strip()
-    hn_disp = hn.strip() if rc_hn == 0 and hn.strip() else "<unset>"
-    smb_disp = smb_nb.strip() if rc_smb == 0 and smb_nb.strip() else "<unset>"
-
-    bad_host_reasons: List[str] = []
-    for label, val in [
-        ("ComputerName", cn),
-        ("LocalHostName", lhn),
-        ("HostName", "" if hn_disp == "<unset>" else hn_disp),
-        ("NetBIOSName", "" if smb_disp == "<unset>" else smb_disp),
-    ]:
-        if not val:
-            continue
-        if has_cjk(val) or has_non_ascii(val):
-            bad_host_reasons.append(f"{label} 含非英文字符({val})")
-        elif any(p in val.lower() for p in ["deimac", "demac", "diannao", "zh-cn"]):
-            bad_host_reasons.append(f"{label} 含中文拼音特征({val})")
-
-    host_obs = f"ComputerName={cn or '-'} | LocalHostName={lhn or '-'} | HostName={hn_disp} | NetBIOS={smb_disp}"
-    if bad_host_reasons:
-        checks.append(
-            make_check(
-                "hostnames",
-                "电脑名、主机名与 SMB NetBIOS 特征",
-                "FAIL",
-                host_obs,
-                f"检测到明显中文/拼音命名特征：{'; '.join(bad_host_reasons)}。Claude Desktop 会直接读取并上报为 remoteToolsDeviceName。",
-                "将 ComputerName、LocalHostName、HostName 及 SMB NetBIOSName 统一改为纯英文名称。",
-                'sudo scutil --set ComputerName "My-Mac" && sudo scutil --set LocalHostName "My-Mac" && sudo scutil --set HostName "My-Mac" && sudo defaults write /Library/Preferences/SystemConfiguration/com.apple.smb.server NetBIOSName -string "My-Mac"',
-                severity="high",
-            )
-        )
-    else:
-        checks.append(make_check("hostnames", "电脑名、主机名与 SMB NetBIOS 特征", "PASS", host_obs, "主机名与局域网 NetBIOS 名均为纯英文，无中文或拼音残留。"))
-
-    # 8. Input Method (Selected + Current Layout ID + All Enabled)
-    _, im_out, _ = run_cmd(["/usr/bin/defaults", "read", "com.apple.HIToolbox", "AppleSelectedInputSources"], timeout=3)
-    _, en_im_out, _ = run_cmd(["/usr/bin/defaults", "read", "com.apple.HIToolbox", "AppleEnabledInputSources"], timeout=3)
-    rc_lay, cur_layout_id, _ = run_cmd(
-        ["/usr/bin/defaults", "read", "com.apple.HIToolbox", "AppleCurrentKeyboardLayoutInputSourceID"],
-        timeout=3,
-    )
-    cur_layout_id = cur_layout_id.strip() if rc_lay == 0 else ""
-    enabled_names: List[str] = []
-    for line in en_im_out.splitlines():
-        m_lay = re.search(r'"KeyboardLayout Name"\s*=\s*"?([^";]+)"?;', line)
-        m_mode = re.search(r'"Input Mode"\s*=\s*"?([^";]+)"?;', line)
-        if m_lay and m_lay.group(1).strip() not in enabled_names:
-            enabled_names.append(m_lay.group(1).strip())
-        elif m_mode:
-            short_mode = m_mode.group(1).strip().split(".")[-1]
-            if short_mode not in enabled_names:
-                enabled_names.append(short_mode)
-
-    is_cn_im = (
-        any(k in im_out for k in ["SCIM", "Pinyin", "Sogou", "Rime"])
-        or any(k in cur_layout_id for k in ["Pinyin", "SCIM", "Sogou", "Rime"])
-    )
-    im_label = "中文输入法 (SCIM/拼音)" if is_cn_im else "英文键盘"
-    en_list_str = ", ".join(enabled_names) if enabled_names else "-"
-    lay_part = f" | LayoutID={cur_layout_id.split('.')[-1]}" if cur_layout_id else ""
-    checks.append(
-        make_check(
-            "input_method",
-            "键盘输入法 (当前激活 & 布局 ID & 已启用)",
-            "WARN" if is_cn_im else "PASS",
-            f"当前={im_label}{lay_part} | 已启用=[{en_list_str}]",
-            "平时打字保留中文输入法正常，但注册/登录新号或过人机验证时建议切到 ABC 英文键盘，避免键盘布局 ID 暴露拼音状态。" if is_cn_im else f"当前激活为英文键盘（已启用列表: {en_list_str}）。",
-            "注册/登录 Claude 前在顶部菜单栏切至 ABC 英文键盘。" if is_cn_im else "",
-        )
-    )
-
-    # 9. Wi-Fi Country Code
-    _, wifi_out, _ = run_cmd(["/usr/sbin/system_profiler", "SPAirPortDataType"], timeout=6)
-    cc_m = re.search(r"Country Code:\s*([A-Za-z0-9]+)", wifi_out)
-    loc_m = re.search(r"Locale:\s*([A-Za-z0-9_]+)", wifi_out)
-    wifi_cc = cc_m.group(1) if cc_m else ""
-    wifi_loc = loc_m.group(1) if loc_m else ""
-    if wifi_cc.upper() in RESTRICTED_COUNTRIES:
-        w_status = "FAIL"
-        w_detail = f"Wi-Fi 网卡当前广播国家码为 {wifi_cc}，说明周边路由器正在广播受限地区 802.11d 国家码。"
-    elif wifi_cc.upper() == t_code:
-        w_status = "PASS"
-        w_detail = f"Wi-Fi 国家码与目标地区 {t_code} 一致。"
-    else:
-        w_status = "INFO"
-        w_detail = f"Wi-Fi 网卡国家码={wifi_cc or '未知'} / Locale={wifi_loc or '未知'}（X2/RoW 为通用国际/未知区码，网页通常无法直接读取，但需警惕部分原生客户端）。"
-    checks.append(make_check("wifi_cc", "Wi-Fi 无线国家码 (802.11d)", w_status, f"{wifi_cc or '-'} / {wifi_loc or '-'}", w_detail))
-
-    # 10. launchd GUI Environment Vars (TZ / LANG / proxy)
-    env_hits: Dict[str, str] = {}
-    for var in ["TZ", "LANG", "LC_ALL", "http_proxy", "https_proxy", "all_proxy"]:
-        rc_e, val_e, _ = run_cmd(["/bin/launchctl", "getenv", var], timeout=2)
-        if rc_e == 0 and val_e.strip():
-            env_hits[var] = val_e.strip()
-    bad_env = [
-        f"{k}={v}"
-        for k, v in env_hits.items()
-        if ("shanghai" in v.lower() or "zh_cn" in v.lower() or "zh-cn" in v.lower())
-    ]
-    if bad_env:
-        checks.append(
-            make_check(
-                "launchd_env",
-                "GUI launchd 环境变量 (TZ / LANG / 代理)",
-                "WARN",
-                ", ".join(bad_env),
-                "launchd 中设置了偏离目标地区的 TZ/LANG 变量，所有桌面 App 启动时都会继承。",
-                "执行 launchctl unsetenv 清理对应变量并重启相关 App。",
-            )
-        )
-    else:
-        checks.append(
-            make_check(
-                "launchd_env",
-                "GUI launchd 环境变量 (TZ / LANG / 代理)",
-                "PASS",
-                ", ".join(f"{k}={v}" for k, v in env_hits.items()) or "全部未设置 (跟随系统)",
-                "GUI 启动环境未注入中国区 TZ/LANG 或异常代理环境变量。",
-            )
-        )
-
-    # 10b. Shell / CLI Proxy & Claude Env Audit (Process env + ~/.zshrc etc., redacted)
-    shell_target_vars = {
-        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
-        "http_proxy", "https_proxy", "all_proxy", "no_proxy",
-        "ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
-        "TZ", "LANG", "LC_ALL",
-    }
-    shell_findings: List[str] = []
-    shell_risky = False
-    for vk in sorted(shell_target_vars):
-        vv = os.environ.get(vk, "").strip()
-        if not vv:
-            continue
-        if vk in {"LANG", "LC_ALL"} and vv in {"C.UTF-8", "C", "en_US.UTF-8", "en_SG.UTF-8"}:
-            continue
-        if any(s in vk for s in ["KEY", "TOKEN", "SECRET", "PASSWORD"]):
-            shell_findings.append(f"env:{vk}=<REDACTED>")
-        else:
-            clean_v = re.sub(r"://[^/@\s]+@", "://<REDACTED>@", vv)
-            shell_findings.append(f"env:{vk}={clean_v}")
-            if "proxy" in vk.lower() or vk == "ANTHROPIC_BASE_URL" or any(x in vv.lower() for x in ["shanghai", "zh_cn", "zh-cn"]):
-                shell_risky = True
-
-    rc_files = [os.path.expanduser(p) for p in ["~/.zshrc", "~/.zprofile", "~/.zshenv", "~/.bash_profile", "~/.bashrc"]]
-    pat_rc = re.compile(
-        r"^\s*(?:export\s+)?(HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY|http_proxy|https_proxy|all_proxy|no_proxy|ANTHROPIC_[A-Z0-9_]+|CLAUDE_[A-Z0-9_]+|TZ|LANG|LC_ALL)\s*=\s*(.+)$"
-    )
-    for rcf in rc_files:
-        if not os.path.isfile(rcf):
-            continue
-        try:
-            with open(rcf, "r", encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    s = line.strip()
-                    if not s or s.startswith("#"):
-                        continue
-                    m = pat_rc.match(s)
-                    if not m:
-                        continue
-                    k_rc, v_rc = m.group(1), m.group(2).strip().strip('"').strip("'")
-                    if any(sec in k_rc for sec in ["KEY", "TOKEN", "SECRET", "PASSWORD"]):
-                        shell_findings.append(f"{os.path.basename(rcf)}:{k_rc}=<REDACTED>")
-                    else:
-                        clean_v = re.sub(r"://[^/@\s]+@", "://<REDACTED>@", v_rc)
-                        shell_findings.append(f"{os.path.basename(rcf)}:{k_rc}={clean_v}")
-                        if "proxy" in k_rc.lower() or k_rc == "ANTHROPIC_BASE_URL" or any(x in v_rc.lower() for x in ["shanghai", "zh_cn", "zh-cn"]):
-                            shell_risky = True
-        except Exception:
-            pass
-
-    checks.append(
-        make_check(
-            "shell_proxy_env",
-            "终端 Shell / CLI 代理与 Claude 环境变量",
-            "WARN" if shell_risky else "PASS",
-            ", ".join(shell_findings[:6]) if shell_findings else "无代理/中转站/异常区域变量",
-            "发现终端代理或中转站配置，运行 Claude Code CLI 时可能走不同于 Clash TUN 的路径或覆盖区域设置。" if shell_risky else "终端环境与配置文件未注入异常代理、中转或中文区域变量。",
-            "确认 Claude Code CLI 与桌面端共用同一出口，避免残留旧代理端口或 ANTHROPIC_BASE_URL。" if shell_risky else "",
-            severity="high" if shell_risky else "low",
-        )
-    )
-
-    # 11. /etc/hosts custom overrides & telemetry blackhole side-effect check
-    custom_hosts: List[str] = []
-    risky_hosts: List[str] = []
-    telemetry_blackhole_hosts: List[str] = []
-    try:
-        with open("/etc/hosts", "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                s = line.strip()
-                if not s or s.startswith("#"):
-                    continue
-                parts = s.split()
-                if len(parts) >= 2 and parts[1].lower() not in {"localhost", "broadcasthost"}:
-                    custom_hosts.append(s[:80])
-                    low_s = s.lower()
-                    if any(k in low_s for k in ("claude", "anthropic", "claudeusercontent", "claudemcpcontent", "stripe", "hcaptcha", "cloudflare", "statsig")):
-                        risky_hosts.append(s[:80])
-                    elif any(k in low_s for k in ("sentry.io", "datadoghq.")):
-                        telemetry_blackhole_hosts.append(s[:80])
-    except Exception:
-        pass
-    if risky_hosts or telemetry_blackhole_hosts or custom_hosts:
-        checks.append(
-            make_check(
-                "etc_hosts",
-                "/etc/hosts 域名劫持与遥测黑洞副作用检测",
-                "FAIL" if risky_hosts else "WARN",
-                (
-                    f"命中核心风险域名 {len(risky_hosts)} 条"
-                    if risky_hosts
-                    else (
-                        f"命中 Sentry/Datadog 黑洞绑定 {len(telemetry_blackhole_hosts)} 条"
-                        if telemetry_blackhole_hosts
-                        else f"发现 {len(custom_hosts)} 条自定义条目"
-                    )
-                ),
-                (
-                    f"核心风险条目: {'; '.join(risky_hosts[:4])}"
-                    if risky_hosts
-                    else (
-                        f"遥测黑洞条目: {'; '.join(telemetry_blackhole_hosts[:4])}。用 hosts 屏蔽 Sentry/Datadog 会导致离线队列积压并触发失败计数上报，建议移除黑洞绑定并改走统一代理出口。"
-                        if telemetry_blackhole_hosts
-                        else f"条目: {'; '.join(custom_hosts[:5])}"
-                    )
-                ),
-                "立即清理 /etc/hosts 中关于 claude / anthropic / stripe / hcaptcha / cloudflare 的绑定！" if risky_hosts else "确认其中不包含陈旧劫持或对 sentry.io / datadoghq 的硬屏蔽。",
-                severity="high" if risky_hosts else "low",
-            )
-        )
-    else:
-        checks.append(make_check("etc_hosts", "/etc/hosts 域名劫持与遥测黑洞副作用检测", "PASS", "仅默认 localhost 条目", "未发现自定义 hosts 劫持或遥测黑洞绑定。"))
-
-    # 12. Installed Apps Awareness (Remote control / proxy / CN apps)
-    try:
-        apps = sorted(os.listdir("/Applications"))
-        flagged = [
-            a for a in apps
-            if any(k in a.lower() for k in ["clash", "shadow", "surge", "awesun", "sunlogin", "todesk", "wechat", "qq", "tailscale", "wireguard", "vpn"])
-        ]
-        checks.append(
-            make_check(
-                "installed_apps_info",
-                "本机网络/远控/常用软件环境提示",
-                "INFO",
-                ", ".join(flagged) if flagged else "无特殊项",
-                "已安装列表仅作隔离参考（网页沙箱读不到此目录）；注意不要将浏览器或 Claude 走向日葵等直连远控通道。",
-            )
-        )
-    except Exception:
-        pass
-
-    # 13. Apple AuthKit Locale, Spell Language & Collation
-    _, ak_loc, _ = run_cmd(["/usr/bin/defaults", "read", "-g", "AKLastLocale"], timeout=3)
-    _, sp_lang, _ = run_cmd(["/usr/bin/defaults", "read", "-g", "NSPreferredSpellServerLanguage"], timeout=3)
-    _, col_ord, _ = run_cmd(["/usr/bin/defaults", "read", "-g", "AppleCollationOrder"], timeout=3)
-    ak_loc = ak_loc.strip()
-    sp_lang = sp_lang.strip()
-    col_ord = col_ord.strip()
-    ak_bad = [
-        f"{k}={v}"
-        for k, v in [("AKLastLocale", ak_loc), ("SpellLang", sp_lang), ("Collation", col_ord)]
-        if v and any(x in v.lower() for x in ["zh_cn", "zh-cn", "zh_hans", "zh-hans"])
-    ]
-    ak_obs = f"AKLastLocale={ak_loc or '-'} | Spell={sp_lang or '自动'} | Collation={col_ord or '默认'}"
-    if ak_bad:
-        checks.append(
-            make_check(
-                "ak_locale_format",
-                "Apple AuthKit 地区与系统拼写配置",
-                "WARN",
-                ak_obs,
-                f"检测到中国区系统子项残留: {', '.join(ak_bad)}。",
-                "检查 System Settings -> Language & Region 与 Keyboard -> Spelling，将拼写语言固定为 English 或 Automatic。",
-            )
-        )
-    else:
-        checks.append(
-            make_check(
-                "ak_locale_format",
-                "Apple AuthKit 地区与系统拼写配置",
-                "PASS",
-                ak_obs,
-                "Apple AuthKit 缓存地区、拼写语言与排序规则均无中国区残留。",
-            )
-        )
-
-    # 14. Sleep / Power Nap Wake-Leak Risk (prevents sleep/wake ERR_NETWORK_CHANGED)
-    rc_pm, pm_out, _ = run_cmd(["/usr/bin/pmset", "-g"], timeout=3)
-    if rc_pm == 0 and pm_out:
-        pm_map: Dict[str, str] = {}
-        for line in pm_out.splitlines():
-            m_pm = re.match(r"^\s*([a-zA-Z0-9_]+)\s+([^\s]+)", line)
-            if m_pm:
-                pm_map[m_pm.group(1).lower()] = m_pm.group(2)
-        powernap = pm_map.get("powernap", "")
-        standby = pm_map.get("standby", "")
-        tcpkeep = pm_map.get("tcpkeepalive", "")
-        pm_obs = f"powernap={powernap or '-'} | standby={standby or '-'} | tcpkeepalive={tcpkeep or '-'}"
-        if powernap == "1":
-            checks.append(
-                make_check(
-                    "power_sleep_leak",
-                    "休眠与 Power Nap 后台断流风险",
-                    "WARN",
-                    pm_obs,
-                    "Power Nap 已开启（1）：Mac 休眠期间会在后台自动唤醒网卡拉取数据，此时 Clash TUN 尚未就绪极易触发 net::ERR_NETWORK_CHANGED 或物理网卡直连漏出真实 IP（也是之前被风控的典型诱因）。",
-                    "关闭 Power Nap，并在 Mac 休眠前退出 Claude Desktop 或浏览器敏感页面。",
-                    "sudo pmset -a powernap 0",
-                    severity="high",
-                )
-            )
-        else:
-            checks.append(
-                make_check(
-                    "power_sleep_leak",
-                    "休眠与 Power Nap 后台断流风险",
-                    "PASS",
-                    pm_obs,
-                    "Power Nap 已关闭，可降低休眠期间后台网络唤醒导致的代理断流风险。",
-                )
-            )
-
-    # 15. Network Services, Multi-VPN Conflict & Interface Proxy/DNS Audit
-    rc_ns, ns_out, _ = run_cmd(["/usr/sbin/networksetup", "-listallnetworkservices"], timeout=4)
-    if rc_ns == 0 and ns_out:
-        services = [
-            l.strip()
-            for l in ns_out.splitlines()
-            if l.strip() and not l.startswith("An asterisk") and not l.startswith("*")
-        ]
-        vpn_svcs = [
-            s for s in services
-            if any(k in s.lower() for k in ["clash", "shadowrocket", "surge", "vpn", "wireguard", "tailscale", "mihomo", "stash"])
-        ]
-        cn_dns_hits: List[str] = []
-        sys_proxy_hits: List[str] = []
-        for iface in [s for s in services if s in {"Wi-Fi", "Ethernet"}][:2]:
-            _, dns_o, _ = run_cmd(["/usr/sbin/networksetup", "-getdnsservers", iface], timeout=3)
-            for dline in dns_o.splitlines():
-                d_ip = dline.strip()
-                if d_ip in CN_DNS_SERVERS:
-                    cn_dns_hits.append(f"{iface}:{d_ip}")
-            for flag, label in [("-getwebproxy", "HTTP"), ("-getsecurewebproxy", "HTTPS"), ("-getsocksfirewallproxy", "SOCKS")]:
-                _, po, _ = run_cmd(["/usr/sbin/networksetup", flag, iface], timeout=3)
-                if "Enabled: Yes" in po:
-                    srv = re.search(r"Server:\s*(.+)", po)
-                    prt = re.search(r"Port:\s*(\d+)", po)
-                    sys_proxy_hits.append(f"{iface} {label}={srv.group(1).strip() if srv else '?'}:{prt.group(1) if prt else '?'}")
-            _, pac_o, _ = run_cmd(["/usr/sbin/networksetup", "-getautoproxyurl", iface], timeout=3)
-            if "Enabled: Yes" in pac_o:
-                sys_proxy_hits.append(f"{iface} PAC=已开启")
-
-        ns_obs = f"代理服务={vpn_svcs or ['无']} | 系统代理={sys_proxy_hits or ['无(纯TUN)']} | 网卡国内DNS={cn_dns_hits or ['无']}"
-        if cn_dns_hits:
-            checks.append(
-                make_check(
-                    "network_services_proxy",
-                    "网卡 DNS、系统代理与多代理服务冲突",
-                    "FAIL",
-                    ns_obs,
-                    f"物理网卡手动配置了国内公共 DNS ({', '.join(cn_dns_hits)})，代理断开瞬间会立即向国内 DNS 发送解析请求。",
-                    "清空物理网卡的国内手动 DNS，或改为 1.1.1.1 / 8.8.8.8。",
-                    severity="high",
-                )
-            )
-        elif len(vpn_svcs) > 1:
-            checks.append(
-                make_check(
-                    "network_services_proxy",
-                    "网卡 DNS、系统代理与多代理服务冲突",
-                    "WARN",
-                    ns_obs,
-                    f"系统中同时注册了多个代理/VPN 服务 ({', '.join(vpn_svcs)})，切勿同时开启以免路由表与 DNS 抢占造成分叉。",
-                    "仅保持单一主力代理（如 Clash）连接，其他 VPN 服务保持断开。",
-                )
-            )
-        else:
-            checks.append(
-                make_check(
-                    "network_services_proxy",
-                    "网卡 DNS、系统代理与多代理服务冲突",
-                    "PASS",
-                    ns_obs,
-                    "物理网卡未配置国内公共 DNS，也无异常系统代理或多重代理冲突。",
-                )
-            )
-
-    # 16. NTP Time Server (/etc/ntp.conf)
-    ntp_servers: List[str] = []
-    try:
-        if os.path.isfile("/etc/ntp.conf"):
-            with open("/etc/ntp.conf", "r", encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    s = line.strip()
-                    if s.startswith("server "):
-                        ntp_servers.append(s.split()[1])
-    except Exception:
-        pass
-    cn_ntp = [s for s in ntp_servers if any(k in s.lower() for k in ["cn.", "aliyun", "tencent", "ntsc", "baidu", "tuna", "ustc"])]
-    if cn_ntp:
-        checks.append(
-            make_check(
-                "ntp_time_server",
-                "系统时间同步服务器 (/etc/ntp.conf)",
-                "WARN",
-                ", ".join(ntp_servers),
-                f"时间服务器包含国内节点 ({', '.join(cn_ntp)})。",
-                "建议改为 time.apple.com。",
-                "sudo systemsetup -setnetworktimeserver time.apple.com",
-            )
-        )
-    else:
-        checks.append(
-            make_check(
-                "ntp_time_server",
-                "系统时间同步服务器 (/etc/ntp.conf)",
-                "PASS",
-                ", ".join(ntp_servers) if ntp_servers else "系统默认 (time.apple.com)",
-                "未配置国内 NTP 服务器。",
-            )
-        )
-
-    # 17. MITM / Custom Root CA Trust Settings (TLS fingerprint / pinning safety)
-    mitm_hits: List[str] = []
-    for t_args in [["/usr/bin/security", "dump-trust-settings"], ["/usr/bin/security", "dump-trust-settings", "-d"]]:
-        rc_t, t_out, _ = run_cmd(t_args, timeout=4)
-        if rc_t == 0 and t_out:
-            for line in t_out.splitlines():
-                if "Cert " in line and any(
-                    k in line.lower()
-                    for k in ["charles", "proxyman", "mitmproxy", "fiddler", "burp", "whistle", "surge", "clash", "http toolkit"]
-                ):
-                    mitm_hits.append(line.strip()[:80])
-    if mitm_hits:
-        checks.append(
-            make_check(
-                "mitm_trust_certs",
-                "自定义 MITM 抓包根证书检测",
-                "WARN",
-                f"发现 {len(mitm_hits)} 个抓包/代理根证书",
-                f"检测到: {'; '.join(mitm_hits[:4])}。若开启 HTTPS 解密会破坏浏览器/Electron 原本的 JA3/JA4 TLS 指纹，极易触发 Cloudflare/风控拦截。",
-                "登录 Claude 时务必关闭一切 HTTPS 解密/抓包代理。",
-                severity="high",
-            )
-        )
-    else:
-        checks.append(
-            make_check(
-                "mitm_trust_certs",
-                "自定义 MITM 抓包根证书检测",
-                "PASS",
-                "未发现抓包工具信任根证书",
-                "系统与用户信任库中未发现 Charles / Proxyman / mitmproxy 等抓包根证书。",
-            )
-        )
-
-    # 18. Hardware Device Identifier Awareness (strictly masked, never outputs raw UUID/serial)
-    _, ioreg_out, _ = run_cmd(["/usr/sbin/ioreg", "-rd1", "-c", "IOPlatformExpertDevice"], timeout=3)
-    model_m = re.search(r'"model"\s*=\s*<"([^"]+)">', ioreg_out)
-    has_hw_uuid = "IOPlatformUUID" in ioreg_out
-    model_str = model_m.group(1) if model_m else "Mac"
-    checks.append(
-        make_check(
-            "hardware_device_fingerprint",
-            "主板不可改硬件标识提醒 (IOPlatformUUID)",
-            "INFO",
-            f"机型={model_str} | IOPlatformUUID={'存在(已脱敏不可改)' if has_hw_uuid else '未知'}",
-            "Safari/浏览器网页沙箱无法读取主板 IOPlatformUUID；但原生 Claude Desktop 理论上可采集系统/硬件级特征。若本机曾被封号，新号建议优先使用全新独立浏览器配置文件（Safari 新 Profile），避免旧桌面端关联。",
-        )
-    )
-
-    # 19. Auto-start before VPN risk (LaunchAgents / openAtLogin)
-    mac_autostart: List[str] = []
-    la_dir = os.path.expanduser("~/Library/LaunchAgents")
-    if os.path.isdir(la_dir):
-        try:
-            for fn in os.listdir(la_dir):
-                if "claude" in fn.lower() or "anthropic" in fn.lower():
-                    mac_autostart.append(f"LaunchAgents/{fn}")
-        except Exception:
-            pass
-    c_cfg_p = os.path.expanduser("~/Library/Application Support/Claude/config.json")
-    if os.path.isfile(c_cfg_p):
-        try:
-            cd = json.load(open(c_cfg_p, "r", encoding="utf-8"))
-            if cd.get("openAtLogin") is True:
-                mac_autostart.append("Claude config.json openAtLogin=true")
-        except Exception:
-            pass
-    if mac_autostart:
-        checks.append(
-            make_check(
-                "claude_autostart_leak",
-                "Claude 开机自启抢跑代理风险 (Boot-Leak)",
-                "FAIL",
-                f"发现 {len(mac_autostart)} 项: {', '.join(mac_autostart[:3])}",
-                "Claude 开机自启可能早于 Clash/VPN TUN 建立连接，每次重启都会向 Anthropic 暴露真实本地 IP。",
-                "在 System Settings -> General -> Login Items 与 Claude Settings 中关闭开机自启。",
-                severity="high",
-            )
-        )
-    else:
-        checks.append(
-            make_check(
-                "claude_autostart_leak",
-                "Claude 开机自启抢跑代理风险 (Boot-Leak)",
-                "PASS",
-                "未发现 Claude 开机自启项",
-                "不存在 Claude 抢先于代理客户端联网的开机自启风险。",
-            )
-        )
-
-    # 20. Global Git Identity Check for Claude Code CLI (privacy-safe: NEVER prints email)
-    gc_path = os.path.expanduser("~/.gitconfig")
-    git_cn_dom = ""
-    git_cjk = False
-    if os.path.isfile(gc_path):
-        try:
-            gc_txt = open(gc_path, "r", encoding="utf-8", errors="replace").read()
-            m_em = re.search(r"^\s*email\s*=\s*(.+)$", gc_txt, re.M | re.I)
-            if m_em:
-                em_v = m_em.group(1).strip().strip('"').strip("'").lower()
-                if "@" in em_v:
-                    d_em = em_v.split("@", 1)[1]
-                    if d_em in {"qq.com", "foxmail.com", "163.com", "126.com", "sina.com", "sina.cn", "sohu.com", "aliyun.com", "yeah.net", "139.com", "189.cn"}:
-                        git_cn_dom = d_em
-            m_nm = re.search(r"^\s*name\s*=\s*(.+)$", gc_txt, re.M | re.I)
-            if m_nm and has_cjk(m_nm.group(1)):
-                git_cjk = True
-        except Exception:
-            pass
-    if git_cn_dom or git_cjk:
-        gp = ([f"邮箱为国内域名(@{git_cn_dom}，已脱敏)"] if git_cn_dom else []) + (["user.name 含中文"] if git_cjk else [])
-        checks.append(
-            make_check(
-                "git_identity_leak",
-                "Git 全局身份配置 (Claude Code CLI 上下文)",
-                "WARN",
-                "；".join(gp),
-                "Claude Code CLI 会读取 git config 作为提交/会话上下文，请避免与旧封号邮箱或中文标识混用。",
-                "建议使用与新号一致的纯英文 Git 身份（git config --global user.name/user.email）。",
-            )
-        )
-    else:
-        checks.append(make_check("git_identity_leak", "Git 全局身份配置 (Claude Code CLI 上下文)", "PASS", "未发现国内邮箱后缀或中文 Git 用户名", "全局 ~/.gitconfig 无明显国内邮箱域名或中文用户名特征。"))
-
-    # 21. Official Claude Telemetry Opt-Out & MDM Policy Status (Read-Only)
-    mac_tele_flags: List[str] = []
-    for tk in ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "DISABLE_TELEMETRY", "DO_NOT_TRACK"):
-        tv = os.environ.get(tk, "").strip()
-        if not tv:
-            rc_tl, out_tl, _ = run_cmd(["/bin/launchctl", "getenv", tk], timeout=2)
-            if rc_tl == 0 and out_tl.strip():
-                tv = out_tl.strip()
-        if tv and tv.lower() not in {"0", "false", "no", "off"}:
-            mac_tele_flags.append(f"env:{tk}={tv}")
-    cc_set_p = os.path.expanduser("~/.claude/settings.json")
-    if os.path.isfile(cc_set_p):
-        try:
-            cc_sd = json.load(open(cc_set_p, "r", encoding="utf-8"))
-            cc_senv = cc_sd.get("env") if isinstance(cc_sd.get("env"), dict) else {}
-            for tk in ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "DISABLE_TELEMETRY", "DO_NOT_TRACK"):
-                tv = str(cc_senv.get(tk, "") or "").strip()
-                if tv and tv.lower() not in {"0", "false", "no", "off"}:
-                    tag = f"settings.json:{tk}={tv}"
-                    if tag not in mac_tele_flags:
-                        mac_tele_flags.append(tag)
-        except Exception:
-            pass
-    mdm_plist = "/Library/Managed Preferences/com.anthropic.claudefordesktop.plist"
-    mdm_flags: List[str] = []
-    if os.path.isfile(mdm_plist):
-        try:
-            with open(mdm_plist, "rb") as mf:
-                mdm_d = plistlib.load(mf)
-            for pk in ("disableNonessentialTelemetry", "disableEssentialTelemetry", "disableNonessentialServices"):
-                if mdm_d.get(pk) is True:
-                    mdm_flags.append(f"MDM:{pk}=true")
-        except Exception:
-            pass
-    mac_tele_cmd = (
-        "launchctl setenv CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC 1 && "
-        "launchctl setenv DISABLE_TELEMETRY 1 && "
-        "launchctl setenv DO_NOT_TRACK 1"
-    )
-    if mac_tele_flags:
-        obs_mtp = ", ".join(mac_tele_flags) + (f" | MDM(仅3P生效): {', '.join(mdm_flags)}" if mdm_flags else "")
-        checks.append(
-            make_check(
-                "claude_telemetry_privacy",
-                "Claude 官方遥测隐私开关状态 (CLI / 子进程 / MDM)",
-                "PASS",
-                obs_mtp,
-                "已启用官方支持的环境变量遥测抑制（对 Claude Code CLI 及桌面端内置子进程生效，合规关闭非必要 OTel 与事件上报）。注：MDM Profile 遥测开关仅对 3P 企业部署生效。",
-            )
-        )
-    else:
-        obs_mtp = "未配置官方遥测抑制环境变量 (默认全量上报)" + (f" | MDM(仅3P生效): {', '.join(mdm_flags)}" if mdm_flags else "")
-        checks.append(
-            make_check(
-                "claude_telemetry_privacy",
-                "Claude 官方遥测隐私开关状态 (CLI / 子进程 / MDM)",
-                "INFO",
-                obs_mtp,
-                "Claude Code 与桌面端内置子进程原生支持 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1、DISABLE_TELEMETRY=1 与 DO_NOT_TRACK=1 官方环境变量合规关闭非必要遥测（避免用 hosts/REJECT 粗暴拦截引发离线队列积压）。",
-                "可选：执行下方命令或在 ~/.zshrc / ~/.claude/settings.json 中开启官方遥测抑制。",
-                mac_tele_cmd,
-            )
-        )
-
-    return {"title": "macOS 系统环境与指纹", "checks": checks}
-
-
-# ---------------------------------------------------------------------------
-# Category 5: Claude Desktop, Claude Code, Keychain, System Wildcard & Safari Residue
-# ---------------------------------------------------------------------------
-def _match_claude_risk_domain(host: str) -> bool:
-    h = (host or "").strip().lower().strip(".")
-    if not h:
-        return False
-    return any(h == root or h.endswith("." + root) for root in CLAUDE_RISK_DOMAINS)
-
-
-def _fmt_bytes(num: int) -> str:
-    if num < 1024:
-        return f"{num} B"
-    if num < 1024 * 1024:
-        return f"{num / 1024:.1f} KB"
-    return f"{num / (1024 * 1024):.1f} MB"
-
-
-def _dir_stats(path: str, max_files: int = 4000) -> Tuple[int, int]:
-    if os.path.isfile(path) or os.path.islink(path):
-        try:
-            return 1, os.lstat(path).st_size
-        except Exception:
-            return 1, 0
-    if not os.path.isdir(path):
-        return 0, 0
-    cnt = 0
-    total = 0
-    for root, _, files in os.walk(path):
-        for fn in files:
-            cnt += 1
-            try:
-                total += os.lstat(os.path.join(root, fn)).st_size
-            except Exception:
-                pass
-            if cnt >= max_files:
-                return cnt, total
-    return cnt, total
-
-
-def _scan_keychain_claude() -> List[str]:
-    """Metadata-only Keychain search (never reads secrets/passwords)."""
-    found: List[str] = []
-    seen = set()
-    keywords = ("claude", "anthropic", "hcaptcha", "stripe")
-
-    # 1. Explicit existence checks (no -w)
-    for svc in ("Claude Safe Storage", "Claude Code-credentials"):
-        rc, _, _ = run_cmd(["/usr/bin/security", "find-generic-password", "-s", svc], timeout=3)
-        if rc == 0 and svc not in seen:
-            seen.add(svc)
-            found.append(svc)
-
-    # 2. Full Keychain metadata dump (no -d, zero secret access)
-    rc_d, dump_out, _ = run_cmd(["/usr/bin/security", "dump-keychain"], timeout=5)
-    if rc_d == 0 and dump_out:
-        attr_pat = re.compile(r'(?:"svce"|"srvr"|0x00000007)\s*<blob>="([^"]+)"')
-        for line in dump_out.splitlines():
-            m = attr_pat.search(line)
-            if not m:
-                continue
-            label = m.group(1).strip()
-            low = label.lower()
-            if any(k in low for k in keywords) and label not in seen:
-                seen.add(label)
-                found.append(label[:64])
-    return found
+    return mac_platform.mac_audit_system(target_cfg, run_cmd)
 
 
 def _scan_safari_claude_storage() -> Dict[str, Any]:
-    """Read-only domain-only scan of Safari WebsiteData, ITP, DeviceIdHashSalts & History."""
-    res: Dict[str, Any] = {
-        "website_data_domains": [],
-        "itp_domains": [],
-        "salt_files": 0,
-        "history_domains": {},
-        "favicon_domains": {},
-        "network_cache_exists": False,
-    }
-
-    # 1. WebKit WebsiteData origin files (origin hostnames only, never storage values)
-    wd_default = os.path.expanduser(
-        "~/Library/Containers/com.apple.Safari/Data/Library/WebKit/WebsiteData/Default"
-    )
-    if os.path.isdir(wd_default):
-        matched_origins = set()
-        for root, _, files in os.walk(wd_default):
-            if "origin" not in files:
-                continue
-            fp = os.path.join(root, "origin")
-            try:
-                raw = open(fp, "rb").read(4096)
-                txt = raw.decode("latin-1", errors="ignore").lower()
-                for cand in re.findall(r"[a-z0-9.-]+\.[a-z]{2,}", txt):
-                    if _match_claude_risk_domain(cand):
-                        matched_origins.add(cand)
-            except Exception:
-                pass
-        res["website_data_domains"] = sorted(matched_origins)
-
-    # 2. WebKit ResourceLoadStatistics / ITP ObservedDomains (domain names only)
-    obs_db = os.path.expanduser(
-        "~/Library/Containers/com.apple.Safari/Data/Library/WebKit/WebsiteData/ResourceLoadStatistics/observations.db"
-    )
-    if os.path.isfile(obs_db):
-        tmp = tempfile.mktemp(suffix=".db")
-        try:
-            shutil.copy2(obs_db, tmp)
-            conn = sqlite3.connect(tmp)
-            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-            if "ObservedDomains" in tables:
-                rows = conn.execute("SELECT registrableDomain FROM ObservedDomains").fetchall()
-                res["itp_domains"] = sorted({r[0].lower() for r in rows if r[0] and _match_claude_risk_domain(r[0])})
-            conn.close()
-        except Exception:
-            pass
-        finally:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-
-    # 3. WebKit DeviceIdHashSalts (file count only)
-    salt_dir = os.path.expanduser(
-        "~/Library/Containers/com.apple.Safari/Data/Library/WebKit/WebsiteData/DeviceIdHashSalts"
-    )
-    if os.path.isdir(salt_dir):
-        scnt, _ = _dir_stats(salt_dir, max_files=200)
-        res["salt_files"] = scnt
-
-    # 4. Safari History.db & Favicon Cache (strictly exact Claude/Anthropic/hCaptcha/Stripe domain counts)
-    for key, dbp, sql in [
-        ("history_domains", "~/Library/Safari/History.db", "SELECT url FROM history_items"),
-        ("favicon_domains", "~/Library/Safari/Favicon Cache/favicons.db", "SELECT url FROM page_url"),
-    ]:
-        ep = os.path.expanduser(dbp)
-        if not os.path.isfile(ep):
-            continue
-        tmp = tempfile.mktemp(suffix=".db")
-        try:
-            shutil.copy2(ep, tmp)
-            conn = sqlite3.connect(tmp)
-            rows = conn.execute(sql).fetchall()
-            conn.close()
-            hits: Dict[str, int] = {}
-            for (u,) in rows:
-                if not u:
-                    continue
-                m = re.match(r"https?://([^/:]+)", str(u).lower())
-                host = m.group(1) if m else ""
-                if _match_claude_risk_domain(host):
-                    hits[host] = hits.get(host, 0) + 1
-            res[key] = hits
-        except Exception:
-            pass
-        finally:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-
-    net_cache = os.path.expanduser("~/Library/Caches/com.apple.Safari/WebKitCache")
-    res["network_cache_exists"] = os.path.isdir(net_cache)
-    return res
+    return mac_platform.scan_safari()
 
 
 def _inspect_desktop_telemetry_artifacts_posix(cdir: str) -> Dict[str, Any]:
-    """Read-only & redacted deep audit of sentry/scope_v3.json, sentry/queue & GrowthBook fcache."""
-    out: Dict[str, Any] = {
-        "sentry_notes": [],
-        "sentry_status": "PASS",
-        "sentry_critical": False,
-        "fcache_notes": [],
-        "fcache_status": "PASS",
-    }
-    scope_path = os.path.join(cdir, "sentry", "scope_v3.json")
-    if os.path.isfile(scope_path):
-        out["sentry_status"] = "WARN"
-        try:
-            with open(scope_path, "r", encoding="utf-8", errors="replace") as f:
-                sc = json.load(f)
-            ev = sc.get("event") if isinstance(sc.get("event"), dict) else {}
-            ctxs = ev.get("contexts") if isinstance(ev.get("contexts"), dict) else {}
-            culture = ctxs.get("culture") if isinstance(ctxs.get("culture"), dict) else {}
-            scope_blk = sc.get("scope") if isinstance(sc.get("scope"), dict) else {}
-            has_uid = bool((scope_blk.get("user") or {}).get("id")) if isinstance(scope_blk.get("user"), dict) else False
-            loc = str(culture.get("locale") or "").strip()
-            tz = str(culture.get("timezone") or "").strip()
-            parts = []
-            if loc or tz:
-                parts.append(f"culture={loc or '-'}/{tz or '-'}")
-            if has_uid:
-                parts.append("含设备UUID绑定(已脱敏)")
-            is_bad_tz = tz in RESTRICTED_TIMEZONES
-            is_bad_loc = loc.lower().startswith(("zh-cn", "zh_cn", "zh-hans"))
-            if is_bad_tz or is_bad_loc:
-                out["sentry_status"] = "FAIL"
-                out["sentry_critical"] = is_bad_tz
-                parts.append("暴露受限区时区/简中环境!")
-            elif has_uid:
-                out["sentry_status"] = "FAIL"
-            out["sentry_notes"].append(f"sentry/scope_v3.json({', '.join(parts) or '存在'})")
-        except Exception:
-            out["sentry_notes"].append("sentry/scope_v3.json(存在)")
-
-    q_dir = os.path.join(cdir, "sentry", "queue")
-    if os.path.isdir(q_dir):
-        q_envelopes = 0
-        try:
-            for fn in os.listdir(q_dir):
-                fp = os.path.join(q_dir, fn)
-                if fn == "queue-v2.json" and os.path.isfile(fp):
-                    try:
-                        q_arr = json.load(open(fp, "r", encoding="utf-8", errors="replace"))
-                        if isinstance(q_arr, list):
-                            q_envelopes = max(q_envelopes, len(q_arr))
-                    except Exception:
-                        pass
-                elif os.path.isfile(fp) and os.path.getsize(fp) > 2:
-                    q_envelopes += 1
-        except Exception:
-            pass
-        if q_envelopes > 0:
-            out["sentry_notes"].append(f"sentry/queue(积压 {q_envelopes} 个待补发离线包!)")
-            if out["sentry_status"] == "PASS":
-                out["sentry_status"] = "WARN"
-
-    fcache_path = os.path.join(cdir, "fcache")
-    if os.path.isfile(fcache_path):
-        out["fcache_status"] = "WARN"
-        try:
-            with open(fcache_path, "rb") as ff:
-                raw = ff.read(2 * 1024 * 1024)
-            gz_idx = raw.find(b"\x1f\x8b\x08", 0, 32) if raw[:3] == b"CLF" else -1
-            if gz_idx != -1:
-                dec = zlib.decompress(raw[gz_idx:], 16 + zlib.MAX_WBITS)
-                fc_obj = json.loads(dec.decode("utf-8", errors="replace"))
-                has_org = bool(fc_obj.get("orgUuid"))
-                mode = str(fc_obj.get("mode") or "-")
-                fcnt = len(fc_obj.get("features") or {}) if isinstance(fc_obj.get("features"), dict) else 0
-                f_parts = [f"mode={mode}", f"features={fcnt}"]
-                if has_org:
-                    f_parts.append("含旧orgUuid(已脱敏)")
-                    out["fcache_status"] = "FAIL"
-                out["fcache_notes"].append(f"fcache({', '.join(f_parts)})")
-            else:
-                out["fcache_notes"].append(f"fcache({len(raw)}B)")
-        except Exception:
-            out["fcache_notes"].append("fcache(存在)")
-
-    return out
+    return inspect_telemetry(cdir)
 
 
 def audit_claude_safari_residue() -> Dict[str, Any]:
-    checks: List[Dict[str, str]] = []
-    inventory: List[Dict[str, str]] = []
-
-    def add_inv(module: str, name: str, path: str, purpose: str, observed: str, status: str) -> None:
-        inventory.append(
-            {
-                "module": module,
-                "name": name,
-                "path": path,
-                "purpose": purpose,
-                "observed": observed,
-                "status": status,
-            }
-        )
-
-    # 1. Installed Claude App / CLI binaries & Running processes (including Cowork VM & SSH/MCP helpers)
-    _, ps_c_out, _ = run_cmd(["/bin/ps", "-axo", "pid,comm"], timeout=3)
-    running_claude: List[str] = []
-    helper_names = {
-        "claude",
-        "claude helper",
-        "claude-code",
-        "cowork",
-        "cowork-svc",
-        "claude-ssh-broker",
-        "claude-ssh-proxy",
-        "chrome-native-host",
-        "github-mcp-server",
-    }
-    for line in ps_c_out.splitlines()[1:]:
-        parts = line.strip().split(None, 1)
-        if len(parts) != 2:
-            continue
-        pid_s, comm = parts
-        base = os.path.basename(comm).lower()
-        if "/applications/claude.app/" in comm.lower() or base in helper_names:
-            running_claude.append(f"{pid_s} {base}")
-
-    installed_apps = [p for p in ["/Applications/Claude.app", os.path.expanduser("~/Applications/Claude.app")] if os.path.exists(p)]
-    cli_bins: List[str] = []
-    rc_wh, wh_out, _ = run_cmd(["/usr/bin/which", "claude"], timeout=2)
-    if rc_wh == 0 and wh_out.strip():
-        cli_bins.append(wh_out.strip())
-    for bp in [
-        "/usr/local/bin/claude",
-        "/opt/homebrew/bin/claude",
-        os.path.expanduser("~/.local/bin/claude"),
-        os.path.expanduser("~/.local/node/bin/claude"),
-    ]:
-        if os.path.exists(bp) and bp not in cli_bins:
-            cli_bins.append(bp)
-
-    proc_obs = (
-        f"进程={len(running_claude)} ({', '.join(running_claude[:3])})" if running_claude else "进程=未运行"
-    ) + f" | Desktop App={'已安装' if installed_apps else '未安装'} | CLI={'已安装(' + cli_bins[0] + ')' if cli_bins else '未安装'}"
-    checks.append(
-        make_check(
-            "claude_proc",
-            "Claude 安装状态与后台进程",
-            "INFO" if (running_claude or installed_apps or cli_bins) else "PASS",
-            proc_obs,
-            "清理本机残留或切换新号前，必须确保所有 Claude Desktop / Claude Code 进程已完全退出。",
-        )
-    )
-    add_inv(
-        "运行与程序",
-        "Claude.app / CLI / 进程",
-        "/Applications/Claude.app · PATH/claude",
-        "确认是否存在桌面端或 CLI 后台常驻进程持续上报遥测/心跳",
-        proc_obs,
-        "INFO" if (running_claude or installed_apps or cli_bins) else "PASS",
-    )
-
-    # 2. Claude Desktop Files & Deep Fingerprint Inspection (Read-only, zero secrets)
-    claude_dir = os.path.expanduser("~/Library/Application Support/Claude")
-    claude_sys_paths = [
-        ("主数据目录", "~/Library/Application Support/Claude", claude_dir),
-        ("桌面端日志", "~/Library/Logs/Claude", os.path.expanduser("~/Library/Logs/Claude")),
-        ("更新器缓存 (ShipIt)", "~/Library/Caches/com.anthropic.claudefordesktop.ShipIt", os.path.expanduser("~/Library/Caches/com.anthropic.claudefordesktop.ShipIt")),
-        ("应用缓存", "~/Library/Caches/com.anthropic.claudefordesktop", os.path.expanduser("~/Library/Caches/com.anthropic.claudefordesktop")),
-        ("偏好设置 plist", "~/Library/Preferences/com.anthropic.claudefordesktop.plist", os.path.expanduser("~/Library/Preferences/com.anthropic.claudefordesktop.plist")),
-        ("Helper 偏好 plist", "~/Library/Preferences/com.anthropic.claudefordesktop.helper.plist", os.path.expanduser("~/Library/Preferences/com.anthropic.claudefordesktop.helper.plist")),
-        ("窗口状态", "~/Library/Saved Application State/com.anthropic.claudefordesktop.savedState", os.path.expanduser("~/Library/Saved Application State/com.anthropic.claudefordesktop.savedState")),
-        ("HTTP 存储", "~/Library/HTTPStorages/com.anthropic.claudefordesktop", os.path.expanduser("~/Library/HTTPStorages/com.anthropic.claudefordesktop")),
-        ("WebKit 缓存", "~/Library/WebKit/com.anthropic.claudefordesktop", os.path.expanduser("~/Library/WebKit/com.anthropic.claudefordesktop")),
-        ("独立 Cookies", "~/Library/Cookies/com.anthropic.claudefordesktop.binarycookies", os.path.expanduser("~/Library/Cookies/com.anthropic.claudefordesktop.binarycookies")),
-    ]
-    existing_paths = [ep for _, _, ep in claude_sys_paths if os.path.exists(ep)]
-    desktop_clean_cmd = (
-        'rm -rf ~/Library/Application\\ Support/Claude ~/Library/Logs/Claude '
-        '~/Library/Caches/com.anthropic.claudefordesktop* '
-        '~/Library/Preferences/com.anthropic.claudefordesktop*.plist '
-        '~/Library/Saved\\ Application\\ State/com.anthropic.claudefordesktop.savedState '
-        '~/Library/HTTPStorages/com.anthropic.claudefordesktop '
-        '~/Library/WebKit/com.anthropic.claudefordesktop '
-        '~/Library/Cookies/com.anthropic.claudefordesktop.binarycookies'
-    )
-
-    ant_did_exists = os.path.isfile(os.path.join(claude_dir, "ant-did"))
-    cookies_db = os.path.join(claude_dir, "Cookies")
-    pref_path = os.path.join(claude_dir, "Preferences")
-    local_state_path = os.path.join(claude_dir, "Local State")
-    cfg_json_path = os.path.join(claude_dir, "config.json")
-    mcp_cfg_path = os.path.join(claude_dir, "claude_desktop_config.json")
-    nps_path = os.path.join(claude_dir, "Network Persistent State")
-    log_dir = os.path.expanduser("~/Library/Logs/Claude")
-
-    # Sub-storage dirs inside Application Support/Claude
-    sub_storage_names = [
-        "Trust Tokens", "DIPS", "SharedStorage", "Local Storage", "Session Storage",
-        "IndexedDB", "WebStorage", "Cache", "Code Cache", "GPUCache",
-        "fcache", "sentry", "blob_storage", "Service Worker", "vm_bundles",
-    ]
-    existing_sub_storages = [s for s in sub_storage_names if os.path.exists(os.path.join(claude_dir, s))]
-
-    desktop_details: List[str] = []
-    desktop_status = "PASS" if not existing_paths else "WARN"
-    desktop_sev = "low"
-
-    # Inventory rows for every key Claude Desktop generated artifact
-    if ant_did_exists:
-        st_sz = os.path.getsize(os.path.join(claude_dir, "ant-did"))
-        desktop_details.append(f"存在 ant-did 设备 ID ({st_sz}B)")
-        desktop_sev = "high"
-        add_inv("Claude Desktop", "ant-did 设备唯一 ID", "~/Library/Application Support/Claude/ant-did", "Anthropic 跨账号关联核心设备指纹文件（绝不可复用旧文件）", f"存在 ({st_sz} B)", "FAIL")
-        desktop_status = "FAIL"
-    else:
-        add_inv("Claude Desktop", "ant-did 设备唯一 ID", "~/Library/Application Support/Claude/ant-did", "Anthropic 跨账号关联核心设备指纹文件", "已清理 (0 残留)", "PASS")
-
-    tele_mac = _inspect_desktop_telemetry_artifacts_posix(claude_dir)
-    if tele_mac["sentry_notes"]:
-        desktop_details.extend(tele_mac["sentry_notes"])
-        if tele_mac["sentry_status"] == "FAIL":
-            desktop_status = "FAIL"
-            desktop_sev = "critical" if tele_mac["sentry_critical"] else "high"
-    add_inv(
-        "Claude Desktop",
-        "Sentry 启动环境快照与离线队列",
-        "~/Library/Application Support/Claude/sentry/{scope_v3.json, queue}",
-        "启动瞬间（未登录前）即落盘记录 culture(locale/timezone 如 zh-CN/Asia/Shanghai) 与设备 UUID",
-        "；".join(tele_mac["sentry_notes"]) if tele_mac["sentry_notes"] else "已清理 (0 残留)",
-        tele_mac["sentry_status"],
-    )
-    if tele_mac["fcache_notes"]:
-        desktop_details.extend(tele_mac["fcache_notes"])
-        if tele_mac["fcache_status"] == "FAIL":
-            desktop_status = "FAIL"
-            if desktop_sev != "critical":
-                desktop_sev = "high"
-    add_inv(
-        "Claude Desktop",
-        "GrowthBook 实验与组织缓存 (fcache)",
-        "~/Library/Application Support/Claude/fcache",
-        "CLF+Gzip 压缩存储旧账号 orgUuid 与实验开关（24h 缓存）",
-        "；".join(tele_mac["fcache_notes"]) if tele_mac["fcache_notes"] else "已清理 (0 残留)",
-        tele_mac["fcache_status"],
-    )
-
-    if os.path.isfile(cookies_db):
-        tmp = tempfile.mktemp(suffix=".db")
-        c_obs = "Cookies 数据库存在"
-        try:
-            shutil.copy2(cookies_db, tmp)
-            conn = sqlite3.connect(tmp)
-            rows = conn.execute("SELECT host_key, name FROM cookies").fetchall()
-            conn.close()
-            names = {r[1] for r in rows}
-            tracked = [
-                n
-                for n in [
-                    "anthropic-device-id", "hmt_id", "__ssid", "_fbp",
-                    "sessionKey", "routingHint", "lastActiveOrg", "cf_clearance", "__cf_bm",
-                ]
-                if n in names
-            ]
-            c_obs = f"{len(rows)} 条 (追踪键: {', '.join(tracked) if tracked else '无'})"
-            desktop_details.append(f"Cookies {c_obs}")
-            if any(k in names for k in ("anthropic-device-id", "hmt_id", "sessionKey", "lastActiveOrg")):
-                desktop_status = "FAIL"
-                desktop_sev = "high"
-        except Exception:
-            desktop_details.append(c_obs)
-        finally:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-        add_inv("Claude Desktop", "Cookies 追踪数据库", "~/Library/Application Support/Claude/Cookies", "存储 anthropic-device-id、hCaptcha hmt_id、sessionKey、__ssid 等（仅查键名不读明文）", c_obs, "FAIL" if desktop_status == "FAIL" else "WARN")
-    else:
-        add_inv("Claude Desktop", "Cookies 追踪数据库", "~/Library/Application Support/Claude/Cookies", "存储 anthropic-device-id、hCaptcha hmt_id、sessionKey 等追踪键", "已清理 (0 残留)", "PASS")
-
-    pref_notes: List[str] = []
-    pref_st = "PASS"
-    if os.path.isfile(pref_path):
-        pref_st = "WARN"
-        try:
-            pref = json.load(open(pref_path, "r", encoding="utf-8"))
-            dicts = (pref.get("spellcheck") or {}).get("dictionaries")
-            if dicts:
-                pref_notes.append(f"拼写字典={dicts}")
-                if any("zh" in str(x).lower() for x in dicts):
-                    pref_st = "FAIL"
-                    desktop_status = "FAIL"
-            if ((pref.get("electron") or {}).get("media") or {}).get("device_id_salt"):
-                pref_notes.append("含 electron device_id_salt")
-            acc_l = (pref.get("intl") or {}).get("accept_languages")
-            if acc_l:
-                pref_notes.append(f"accept_lang={acc_l}")
-                if "zh-cn" in str(acc_l).lower():
-                    pref_st = "FAIL"
-                    desktop_status = "FAIL"
-        except Exception:
-            pref_notes.append("Preferences 存在")
-    if os.path.isfile(local_state_path):
-        if pref_st == "PASS":
-            pref_st = "WARN"
-        try:
-            ls_d = json.load(open(local_state_path, "r", encoding="utf-8"))
-            if ls_d.get("os_crypt"):
-                pref_notes.append("Local State 含 os_crypt")
-            vc = ls_d.get("variations_country")
-            if vc:
-                pref_notes.append(f"variations={vc}")
-                if str(vc).lower() in {"cn", "hk"}:
-                    pref_st = "FAIL"
-                    desktop_status = "FAIL"
-        except Exception:
-            pref_notes.append("Local State 存在")
-    if pref_notes:
-        desktop_details.extend(pref_notes)
-    add_inv(
-        "Claude Desktop",
-        "Preferences & Local State",
-        "~/Library/Application Support/Claude/{Preferences, Local State}",
-        "记录 electron device_id_salt 设备盐、拼写语言字典、os_crypt 加密头",
-        "；".join(pref_notes) if pref_notes else "已清理 (0 残留)",
-        pref_st,
-    )
-
-    cfg_notes: List[str] = []
-    cfg_st = "PASS"
-    if os.path.isfile(cfg_json_path):
-        cfg_st = "WARN"
-        try:
-            cjson = json.load(open(cfg_json_path, "r", encoding="utf-8"))
-            if cjson.get("locale"):
-                cfg_notes.append(f"locale={cjson.get('locale')}")
-            for k_u in ("lastKnownAccountUuid", "orgUuid", "userId", "oauthAccount"):
-                if cjson.get(k_u):
-                    cfg_notes.append(f"含 {k_u}")
-                    cfg_st = "FAIL"
-                    desktop_status = "FAIL"
-        except Exception:
-            cfg_notes.append("config.json 存在")
-    if os.path.isfile(mcp_cfg_path):
-        if cfg_st == "PASS":
-            cfg_st = "WARN"
-        try:
-            cfg = json.load(open(mcp_cfg_path, "r", encoding="utf-8"))
-            dev_name = str((cfg.get("preferences") or {}).get("remoteToolsDeviceName", ""))
-            if dev_name:
-                if has_cjk(dev_name) or "deimac" in dev_name.lower() or "demac" in dev_name.lower():
-                    cfg_st = "FAIL"
-                    desktop_status = "FAIL"
-                    cfg_notes.append(f"remoteToolsDeviceName 含中文/拼音: {dev_name}")
-                else:
-                    cfg_notes.append(f"remoteToolsDeviceName={dev_name}")
-            mcps = cfg.get("mcpServers")
-            if isinstance(mcps, dict) and mcps:
-                cfg_notes.append(f"MCP 配置 {len(mcps)} 个")
-        except Exception:
-            cfg_notes.append("claude_desktop_config.json 存在")
-    if cfg_notes:
-        desktop_details.extend(cfg_notes)
-    add_inv(
-        "Claude Desktop",
-        "config.json & desktop_config",
-        "~/Library/Application Support/Claude/{config.json, claude_desktop_config.json}",
-        "保存旧账号 lastKnownAccountUuid、locale 与上报给服务端的 remoteToolsDeviceName",
-        "；".join(cfg_notes) if cfg_notes else "已清理 (0 残留)",
-        cfg_st,
-    )
-
-    nps_notes: List[str] = []
-    if os.path.isfile(nps_path):
-        try:
-            nps = json.load(open(nps_path, "r", encoding="utf-8"))
-            broken = ((nps.get("net") or {}).get("http_server_properties") or {}).get("broken_alternative_services") or []
-            quic_fail = sum(
-                int(item.get("broken_count", 0))
-                for item in broken
-                if isinstance(item, dict) and item.get("protocol_str") == "quic"
-            )
-            nps_notes.append(f"Network Persistent State 存在 (QUIC 失败 {quic_fail} 次)")
-        except Exception:
-            nps_notes.append("Network Persistent State 存在")
-    if existing_sub_storages:
-        nps_notes.append(f"子存储目录 {len(existing_sub_storages)} 个 ({', '.join(existing_sub_storages[:6])})")
-    if nps_notes:
-        desktop_details.extend(nps_notes)
-    add_inv(
-        "Claude Desktop",
-        "Electron 网页存储与缓存",
-        "~/Library/Application Support/Claude/{Local Storage, IndexedDB, Trust Tokens, DIPS, Cache, sentry...}",
-        "Electron 沙箱本地存储、Trust Tokens、DIPS 追踪表、QUIC 记录与崩溃缓存",
-        "；".join(nps_notes) if nps_notes else "已清理 (0 残留)",
-        "WARN" if nps_notes else "PASS",
-    )
-
-    # Logs & ShipIt / Preferences / SavedState / HTTPStorages
-    log_obs = "已清理 (0 残留)"
-    log_st = "PASS"
-    if os.path.isdir(log_dir):
-        rb_cnt = 0
-        ban_cnt = 0
-        evict_cnt = 0
-        tele_err_cnt = 0
-        stripe_cnt = 0
-        net_cnt = 0
-        log_files = [fn for fn in os.listdir(log_dir) if fn.endswith(".log") and os.path.isfile(os.path.join(log_dir, fn))]
-        for fn in log_files:
-            try:
-                txt = open(os.path.join(log_dir, fn), "r", encoding="utf-8", errors="replace").read()
-                rb_cnt += txt.count("region_blocked") + txt.count("isn't available in your region")
-                ban_cnt += txt.count("account_banned") + txt.count("bad_device_id")
-                evict_cnt += txt.count("Claude-Login-Ended-By") + txt.count("login_limit_reached")
-                tele_err_cnt += txt.count("[EventLogging] Batch flush FAILED")
-                stripe_cnt += txt.count("Failed to load Stripe.js")
-                net_cnt += txt.count("ERR_NETWORK_CHANGED")
-            except Exception:
-                pass
-        log_obs = (
-            f"{len(log_files)} 个日志 (region_blocked={rb_cnt}, banned/bad_did={ban_cnt}, "
-            f"踢号={evict_cnt}, 遥测拒签={tele_err_cnt}, Stripe失败={stripe_cnt}, 网络变化={net_cnt})"
-        )
-        if ban_cnt or rb_cnt or evict_cnt:
-            log_st = "FAIL"
-            desktop_status = "FAIL"
-            desktop_sev = "high"
-        else:
-            log_st = "WARN"
-        desktop_details.append(f"日志: {log_obs}")
-    add_inv(
-        "Claude Desktop",
-        "运行日志与封禁历史",
-        "~/Library/Logs/Claude/*.log",
-        "记录 region_blocked、account_banned、Stripe.js 失败与休眠断流事件",
-        log_obs,
-        log_st,
-    )
-
-    extra_sys_found = [label for label, _, ep in claude_sys_paths[2:] if os.path.exists(ep)]
-    add_inv(
-        "Claude Desktop",
-        "ShipIt 缓存 / plist / HTTPStorages",
-        "~/Library/{Caches, Preferences, Saved Application State, HTTPStorages, WebKit, Cookies}/com.anthropic.claudefordesktop*",
-        "自动更新缓存、窗口偏好 plist、原生 HTTP Cookie 存储与 WebKit 缓存",
-        f"存在 {len(extra_sys_found)} 项: {', '.join(extra_sys_found)}" if extra_sys_found else "已清理 (0 残留)",
-        "WARN" if extra_sys_found else "PASS",
-    )
-
-    if not existing_paths:
-        checks.append(
-            make_check(
-                "claude_desktop_files",
-                "Claude Desktop 全套设备指纹与系统缓存",
-                "PASS",
-                "已清理干净 (10 类路径全部 0 残留)",
-                "未发现 ant-did、Cookies、hCaptcha hmt_id、device_id_salt、lastKnownAccountUuid、日志或 ShipIt/plist 残留。",
-            )
-        )
-    else:
-        checks.append(
-            make_check(
-                "claude_desktop_files",
-                "Claude Desktop 全套设备指纹与系统缓存",
-                desktop_status,
-                f"存在 {len(existing_paths)} 个本地路径",
-                "；".join(desktop_details) if desktop_details else f"存在路径: {', '.join(existing_paths[:4])}",
-                "换新账号前务必先完全退出 Claude Desktop，再彻底删除以上所有桌面端目录与钥匙串，避免 ant-did / Cookies / device_id_salt 跨号关联！",
-                desktop_clean_cmd,
-                severity=desktop_sev,
-            )
-        )
-
-    # 3. Claude Code CLI (~/.claude.json, ~/.claude/*, XDG dirs)
-    cc_json = os.path.expanduser("~/.claude.json")
-    cc_dir = os.path.expanduser("~/.claude")
-    cc_backups = [
-        os.path.join(os.path.expanduser("~"), fn)
-        for fn in os.listdir(os.path.expanduser("~"))
-        if fn.startswith(".claude.json.backup")
-    ]
-    xdg_candidates = [
-        os.path.expanduser("~/.anthropic"),
-        os.path.expanduser("~/.config/claude"),
-        os.path.expanduser("~/.config/claude-code"),
-        os.path.expanduser("~/.config/anthropic"),
-        os.path.expanduser("~/.cache/claude"),
-        os.path.expanduser("~/.cache/claude-code"),
-        os.path.expanduser("~/.cache/anthropic"),
-        os.path.expanduser("~/.local/share/claude"),
-        os.path.expanduser("~/.local/state/claude"),
-    ]
-    existing_xdg = [p for p in xdg_candidates if os.path.exists(p)]
-
-    cc_notes: List[str] = []
-    cc_status = "PASS"
-    if os.path.isfile(cc_json):
-        cc_status = "WARN"
-        try:
-            d = json.load(open(cc_json, "r", encoding="utf-8"))
-            flags = [
-                k
-                for k in ["machineID", "userID", "oauthAccount", "anonymousId", "firstStartTime", "cachedStatsigGates", "cachedGrowthBookFeatures"]
-                if k in d
-            ]
-            cc_notes.append(f"~/.claude.json 含 {', '.join(flags) if flags else '配置'}")
-            if any(k in d for k in ("machineID", "userID", "oauthAccount", "anonymousId")):
-                cc_status = "FAIL"
-            projs = d.get("projects")
-            if isinstance(projs, dict) and any(has_cjk(str(pk)) for pk in projs.keys()):
-                cc_notes.append("projects 记录含中文路径")
-        except Exception:
-            cc_notes.append("~/.claude.json 存在")
-    if cc_backups:
-        cc_status = "WARN" if cc_status == "PASS" else cc_status
-        cc_notes.append(f"含 {len(cc_backups)} 个 .claude.json.backup 备份")
-    if os.path.exists(cc_dir):
-        cc_status = "WARN" if cc_status == "PASS" else cc_status
-        sub_cc = []
-        try:
-            for item in sorted(os.listdir(cc_dir)):
-                if item in {"settings.json", "settings.local.json", "statsig", "projects", "debug", "telemetry", "ide", "credentials.json", ".credentials.json", "session-env", "file-history"}:
-                    sub_cc.append(item)
-            if ".credentials.json" in sub_cc or "credentials.json" in sub_cc:
-                cc_status = "FAIL"
-        except Exception:
-            pass
-        mac_relay_hits: List[str] = []
-        for sf in ("settings.json", "settings.local.json"):
-            sfp = os.path.join(cc_dir, sf)
-            if os.path.isfile(sfp):
-                try:
-                    sd = json.load(open(sfp, "r", encoding="utf-8"))
-                    s_env = sd.get("env") if isinstance(sd.get("env"), dict) else {}
-                    for ek in ("ANTHROPIC_BASE_URL", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
-                        if s_env.get(ek):
-                            clean_ev = re.sub(r"://[^/@\s]+@", "://<REDACTED>@", str(s_env[ek]))
-                            cc_notes.append(f"{sf}:{ek}={clean_ev}")
-                            if ek == "ANTHROPIC_BASE_URL" and "api.anthropic.com" not in clean_ev.lower():
-                                mac_relay_hits.append(f"{sf}:ANTHROPIC_BASE_URL={clean_ev}")
-                    if sd.get("apiKeyHelper"):
-                        cc_notes.append(f"{sf} 含 apiKeyHelper")
-                        mac_relay_hits.append(f"{sf}:apiKeyHelper")
-                except Exception:
-                    pass
-        fcnt, fbytes = _dir_stats(cc_dir, max_files=1000)
-        cc_notes.append(f"~/.claude/ ({fcnt} 文件, {_fmt_bytes(fbytes)}; 含 {', '.join(sub_cc[:6]) if sub_cc else '子项'})")
-    else:
-        mac_relay_hits = []
-    if existing_xdg:
-        cc_status = "WARN" if cc_status == "PASS" else cc_status
-        cc_notes.append(f"XDG/隐藏目录 {len(existing_xdg)} 个: {', '.join(os.path.basename(p) for p in existing_xdg)}")
-
-    for h_lbl, h_path in [
-        ("claude-code-router", os.path.expanduser("~/.claude-code-router")),
-        ("cc-switch", os.path.expanduser("~/.cc-switch")),
-        ("cc-switch(.config)", os.path.expanduser("~/.config/cc-switch")),
-        ("claude-relay", os.path.expanduser("~/.claude-relay")),
-    ]:
-        if os.path.exists(h_path):
-            mac_relay_hits.append(f"工具目录:{h_lbl}")
-    env_bu = os.environ.get("ANTHROPIC_BASE_URL", "").strip()
-    if env_bu and "api.anthropic.com" not in env_bu.lower():
-        safe_env_bu = re.sub(r"://[^/@\s]+@", "://<REDACTED>@", env_bu)
-        mac_relay_hits.append(f"env:ANTHROPIC_BASE_URL={safe_env_bu}")
-    if mac_relay_hits:
-        checks.append(
-            make_check(
-                "claude_relay_harness",
-                "第三方中转站 / 本地转发桥 / 套壳 Harness 检测 (高危封号红线)",
-                "FAIL",
-                f"命中 {len(mac_relay_hits)} 项: {', '.join(mac_relay_hits[:4])}",
-                "检测到非官方的 ANTHROPIC_BASE_URL、本地转发桥或第三方切换/中转工具！Anthropic 明确严查在第三方套壳/中转工具中复用 Pro/Max OAuth 订阅凭据，极易直接触发 account_banned！",
-                "使用官方订阅新号时，务必移除 settings.json 与环境变量中的自定义 ANTHROPIC_BASE_URL / apiKeyHelper。",
-                severity="critical",
-            )
-        )
-        add_inv("Claude Code CLI", "中转站 / 本地转发配置", "~/.claude/settings*.json · ~/.cc-switch · ~/.claude-code-router", "检测非官方 ANTHROPIC_BASE_URL 与 OAuth 套壳转发（高频封号诱因）", ", ".join(mac_relay_hits[:4]), "FAIL")
-    else:
-        checks.append(
-            make_check(
-                "claude_relay_harness",
-                "第三方中转站 / 本地转发桥 / 套壳 Harness 检测 (高危封号红线)",
-                "PASS",
-                "未发现自定义 ANTHROPIC_BASE_URL 或第三方转发工具",
-                "Claude Code 配置未指向第三方中转站或本地转发代理桥。",
-            )
-        )
-
-    cli_clean_cmd = "rm -rf ~/.claude.json ~/.claude.json.backup* ~/.claude ~/.anthropic ~/.config/claude* ~/.cache/claude* ~/.local/share/claude* ~/.local/state/claude*"
-    if cc_status == "PASS":
-        checks.append(
-            make_check(
-                "claude_code_cli",
-                "Claude Code CLI 全路径状态 (~/.claude* & XDG)",
-                "PASS",
-                "已清理干净 (0 残留)",
-                "~/.claude.json、备份文件、~/.claude 目录及 ~/.config / ~/.cache / ~/.local 下均无残留。",
-            )
-        )
-    else:
-        checks.append(
-            make_check(
-                "claude_code_cli",
-                "Claude Code CLI 全路径状态 (~/.claude* & XDG)",
-                cc_status,
-                "；".join(cc_notes),
-                "Claude Code CLI 会在 ~/.claude.json 持久化 machineID / userID / oauthAccount，并在 ~/.claude/statsig 保存实验分组标识，换新号前需一并清理。",
-                "若本机曾登录过被封账号的 Claude Code，请先清理 CLI 状态目录。",
-                cli_clean_cmd,
-                severity="high" if cc_status == "FAIL" else "low",
-            )
-        )
-    add_inv(
-        "Claude Code CLI",
-        "~/.claude.json & ~/.claude/ & XDG",
-        "~/.claude.json* · ~/.claude/ · ~/.config|cache|local/*claude*",
-        "存储 CLI 的 machineID、userID、oauthAccount、statsig 标识与会话调试日志",
-        "；".join(cc_notes) if cc_notes else "已清理 (0 残留)",
-        cc_status,
-    )
-
-    # 4. Full Keychain Metadata Scan (Claude / Anthropic / hCaptcha / Stripe — ZERO secrets read)
-    kc_found = _scan_keychain_claude()
-    if kc_found:
-        checks.append(
-            make_check(
-                "claude_keychain",
-                "macOS 钥匙串全量脱敏检索 (Claude / Anthropic / Stripe)",
-                "FAIL",
-                f"发现 {len(kc_found)} 项: {', '.join(kc_found[:6])}",
-                "钥匙串中仍存有 Claude 加密存储密钥（Claude Safe Storage）或相关凭证条目，重新安装/启动桌面端会自动复用旧加密密钥或凭据。",
-                "先退出 Claude 后删除对应钥匙串条目。",
-                'security delete-generic-password -s "Claude Safe Storage"; security delete-generic-password -s "Claude Code-credentials"',
-                severity="high",
-            )
-        )
-        add_inv("钥匙串与系统注册", "登录钥匙串全量扫描", "login.keychain-db (仅查服务名，不读密码)", "Electron Safe Storage 加密主密钥与 Claude Code OAuth 凭据", f"发现 {len(kc_found)} 项: {', '.join(kc_found[:4])}", "FAIL")
-    else:
-        checks.append(
-            make_check(
-                "claude_keychain",
-                "macOS 钥匙串全量脱敏检索 (Claude / Anthropic / Stripe)",
-                "PASS",
-                "全库扫描 0 残留",
-                "已遍历登录钥匙串服务名元数据（不读密码），未检测到任何 claude / anthropic / hcaptcha / stripe 凭证项。",
-            )
-        )
-        add_inv("钥匙串与系统注册", "登录钥匙串全量扫描", "login.keychain-db (仅查服务名，不读密码)", "Electron Safe Storage 加密主密钥与 Claude Code OAuth 凭据", "全库 0 残留", "PASS")
-
-    # 5. Broad macOS Wildcard Sweep (~/Library/*, DiagnosticReports, LaunchServices, Trash, Temp, IDE)
-    lib_root = os.path.expanduser("~/Library")
-    lib_subtrees = [
-        "Application Support", "Caches", "Preferences", "Logs",
-        "Containers", "Group Containers", "HTTPStorages",
-        "Saved Application State", "WebKit", "LaunchAgents",
-        "Cookies", "Application Scripts",
-    ]
-    known_ep_set = set(existing_paths)
-    wildcard_lib_hits: List[str] = []
-    for sub in lib_subtrees:
-        d = os.path.join(lib_root, sub)
-        if not os.path.isdir(d):
-            continue
-        try:
-            for name in os.listdir(d):
-                low = name.lower()
-                if "claude" in low or "anthropic" in low:
-                    full_p = os.path.join(d, name)
-                    if full_p not in known_ep_set:
-                        wildcard_lib_hits.append(f"~/Library/{sub}/{name}")
-        except Exception:
-            pass
-
-    crash_hits: List[str] = []
-    for cdir in [
-        os.path.expanduser("~/Library/Logs/DiagnosticReports"),
-        "/Library/Logs/DiagnosticReports",
-        os.path.expanduser("~/Library/Application Support/CrashReporter"),
-    ]:
-        if not os.path.isdir(cdir):
-            continue
-        try:
-            for fn in os.listdir(cdir):
-                if "claude" in fn.lower() or "anthropic" in fn.lower():
-                    crash_hits.append(fn)
-        except Exception:
-            pass
-
-    # LaunchServices claude:// URL scheme registration
-    ls_claude_registered = False
-    ls_plist = os.path.expanduser("~/Library/Preferences/com.apple.LaunchServices/com.apple.launchservices.secure.plist")
-    if os.path.isfile(ls_plist):
-        try:
-            with open(ls_plist, "rb") as f:
-                ls_data = plistlib.load(f)
-            for h in ls_data.get("LSHandlers") or []:
-                if isinstance(h, dict) and (
-                    str(h.get("LSHandlerURLScheme", "")).lower() == "claude"
-                    or "anthropic" in str(h.get("LSHandlerRoleAll", "")).lower()
-                ):
-                    ls_claude_registered = True
-                    break
-        except Exception:
-            pass
-
-    # ~/.Trash check
-    trash_hits: List[str] = []
-    trash_dir = os.path.expanduser("~/.Trash")
-    if os.path.isdir(trash_dir):
-        try:
-            trash_hits = [fn for fn in os.listdir(trash_dir) if "claude" in fn.lower() or "anthropic" in fn.lower()]
-        except Exception:
-            pass
-
-    # Darwin per-user cache/temp & /tmp (distinguish official Anthropic/Claude vs unrelated 3rd-party dirs)
-    official_tmp_hits: List[str] = []
-    official_tmp_paths: List[str] = []
-    third_party_tmp_cnt = 0
-    tmp_dirs_to_scan = ["/tmp"]
-    for gc_key in ("DARWIN_USER_CACHE_DIR", "DARWIN_USER_TEMP_DIR"):
-        rc_g, gd, _ = run_cmd(["/usr/bin/getconf", gc_key], timeout=2)
-        if rc_g == 0 and gd.strip() and os.path.isdir(gd.strip()):
-            tmp_dirs_to_scan.append(gd.strip())
-    for td in tmp_dirs_to_scan:
-        try:
-            for fn in os.listdir(td):
-                low = fn.lower()
-                if "anthropic" in low or low.startswith(("claude-", "claude_", "com.anthropic")):
-                    full_tp = os.path.join(td, fn)
-                    official_tmp_paths.append(full_tp)
-                    official_tmp_hits.append(full_tp if td == "/tmp" else f"{os.path.basename(td.rstrip('/'))}/{fn}")
-                elif "claude" in low:
-                    third_party_tmp_cnt += 1
-        except Exception:
-            pass
-
-    # IDE Extensions & Global Storage (VS Code / Cursor / Windsurf / JetBrains)
-    ide_hits: List[str] = []
-    for ide_label, ide_dir in [
-        ("VS Code 扩展", "~/.vscode/extensions"),
-        ("Cursor 扩展", "~/.cursor/extensions"),
-        ("Windsurf 扩展", "~/.windsurf/extensions"),
-        ("VS Code 存储", "~/Library/Application Support/Code/User/globalStorage"),
-        ("Cursor 存储", "~/Library/Application Support/Cursor/User/globalStorage"),
-        ("JetBrains 插件", "~/Library/Application Support/JetBrains"),
-    ]:
-        ep = os.path.expanduser(ide_dir)
-        if not os.path.isdir(ep):
-            continue
-        try:
-            for fn in os.listdir(ep):
-                low = fn.lower()
-                if "anthropic" in low or "claude" in low:
-                    ide_hits.append(f"{ide_label}:{fn}")
-        except Exception:
-            pass
-
-    wc_problems: List[str] = []
-    if wildcard_lib_hits:
-        wc_problems.append(f"~/Library 边缘路径 {len(wildcard_lib_hits)} 项 ({', '.join(wildcard_lib_hits[:3])})")
-    if crash_hits:
-        wc_problems.append(f"崩溃日志 {len(crash_hits)} 个 ({', '.join(crash_hits[:3])})")
-    if official_tmp_hits:
-        wc_problems.append(f"系统临时/缓存 {len(official_tmp_hits)} 项 ({', '.join(official_tmp_hits[:3])})")
-    if trash_hits:
-        wc_problems.append(f"废纸篓残留 {len(trash_hits)} 项 ({', '.join(trash_hits[:3])})")
-    if ide_hits:
-        wc_problems.append(f"IDE 插件/存储 {len(ide_hits)} 项 ({', '.join(ide_hits[:3])})")
-
-    wc_info_notes: List[str] = []
-    if ls_claude_registered:
-        wc_info_notes.append("LaunchServices 仍保留 claude:// 协议注册（macOS 无害登记，重启或清 LaunchServices 可刷新）")
-    if third_party_tmp_cnt:
-        wc_info_notes.append(f"系统临时目录含 {third_party_tmp_cnt} 个第三方含 claude 字样临时目录（非官方客户端文件）")
-
-    wc_fix_cmd = ""
-    if official_tmp_paths:
-        quoted = " ".join(f'"{p}"' for p in official_tmp_paths[:6])
-        wc_fix_cmd = f"rm -rf {quoted}"
-
-    checks.append(
-        make_check(
-            "claude_wildcard_system",
-            "macOS 全盘边缘残留扫描 (Library 通配 / 崩溃日志 / 临时目录 / 废纸篓 / IDE)",
-            "WARN" if wc_problems else "PASS",
-            "；".join(wc_problems) if wc_problems else ("0 残留" + (f" · {'；'.join(wc_info_notes)}" if wc_info_notes else "")),
-            "已遍历 ~/Library 12 个子目录、DiagnosticReports、CrashReporter、Darwin 缓存/临时目录、~/.Trash、LaunchServices 与 VS Code/Cursor/JetBrains 插件目录。"
-            + (f" 附加提示: {'；'.join(wc_info_notes)}" if wc_info_notes else ""),
-            "请核对并清理上述边缘残留文件，或清空废纸篓。" if wc_problems else "",
-            wc_fix_cmd,
-        )
-    )
-    add_inv("系统缓存/日志/IDE", "~/Library 12 子目录通配", "~/Library/{Containers, Group Containers, LaunchAgents, Caches...}/*claude|anthropic*", "捕获边缘插件、沙箱容器、开机自启项与隐藏缓存", f"发现 {len(wildcard_lib_hits)} 项" if wildcard_lib_hits else "全盘 0 残留", "WARN" if wildcard_lib_hits else "PASS")
-    add_inv("系统缓存/日志/IDE", "崩溃日志 & 系统临时目录 & 废纸篓", "DiagnosticReports · /var/folders/.../{C,T} · /tmp · ~/.Trash", "Electron 崩溃转储 .ips、Squirrel 临时目录与未清空的废纸篓文件", ("；".join(p for p in [f"崩溃:{len(crash_hits)}" if crash_hits else "", f"官方临时:{len(official_tmp_hits)}" if official_tmp_hits else "", f"废纸篓:{len(trash_hits)}" if trash_hits else ""] if p) or f"官方文件 0 残留" + (f" (另有 {third_party_tmp_cnt} 个第三方临时项)" if third_party_tmp_cnt else "")), "WARN" if (crash_hits or official_tmp_hits or trash_hits) else "PASS")
-    add_inv("钥匙串与系统注册", "LaunchServices 协议注册", "~/Library/Preferences/com.apple.LaunchServices/...secure.plist", "记录 claude:// 深链打开方式（不直接上传，但证明曾装过桌面端）", "保留 claude:// 登记 (低风险)" if ls_claude_registered else "未注册", "INFO" if ls_claude_registered else "PASS")
-    add_inv("系统缓存/日志/IDE", "IDE 扩展与全局存储", "VS Code / Cursor / Windsurf / JetBrains", "检测 anthropic.claude-code 扩展及其独立缓存/认证存储", f"发现 {len(ide_hits)} 项: {', '.join(ide_hits[:3])}" if ide_hits else "0 残留 / 未安装", "WARN" if ide_hits else "PASS")
-
-    # 6. Safari Deep Claude/Anthropic/hCaptcha/Stripe Storage Scan (WebsiteData + ITP + Salts + History)
-    safari_deep = _scan_safari_claude_storage()
-    wd_doms = safari_deep["website_data_domains"]
-    itp_doms = safari_deep["itp_domains"]
-    salt_cnt = safari_deep["salt_files"]
-    hist_doms = safari_deep["history_domains"]
-    fav_doms = safari_deep["favicon_domains"]
-
-    has_active_safari_claude = bool(wd_doms or itp_doms)
-    deep_parts: List[str] = []
-    if wd_doms:
-        deep_parts.append(f"WebsiteData 残留域名: {', '.join(wd_doms)}")
-    if itp_doms:
-        deep_parts.append(f"ITP 追踪库残留: {', '.join(itp_doms)}")
-    if salt_cnt:
-        deep_parts.append(f"DeviceIdHashSalts ({salt_cnt} 个文件)")
-    if hist_doms:
-        hist_summary = ", ".join(f"{k}({v})" for k, v in sorted(hist_doms.items())[:5])
-        deep_parts.append(f"访问历史匹配 {sum(hist_doms.values())} 条 ({hist_summary})")
-    if fav_doms:
-        deep_parts.append(f"Favicon 缓存: {', '.join(sorted(fav_doms.keys()))}")
-
-    if has_active_safari_claude:
-        checks.append(
-            make_check(
-                "safari_claude_storage",
-                "Safari 深度存储残留 (WebsiteData / ITP / DeviceIdHashSalts / 历史)",
-                "FAIL",
-                "；".join(deep_parts),
-                "在 Safari 本地 WebKit 存储（LocalStorage / IndexedDB / ServiceWorker / ITP 统计库）中实测到 Claude / Anthropic 站点数据残留！如果不清理就直接用当前 Safari 配置文件登新号，旧设备标记、hCaptcha 令牌与缓存会直接把新旧账号关联成危险设备。",
-                "强烈建议二选一：① 打开 Safari -> Settings -> Privacy -> Manage Website Data，逐一搜索并移除 claude、anthropic、hcaptcha、stripe，并清理相关历史记录；② 更彻底：在 Safari -> Settings -> Profiles 新建一个全新的独立配置文件专门用于新号（全新 Cookies、WebsiteData、DeviceIdHashSalts，且不删你原配置文件里的其他网站登录）！",
-                severity="high",
-            )
-        )
-    elif hist_doms or fav_doms:
-        checks.append(
-            make_check(
-                "safari_claude_storage",
-                "Safari 深度存储残留 (WebsiteData / ITP / DeviceIdHashSalts / 历史)",
-                "WARN",
-                "；".join(deep_parts),
-                "WebsiteData 与 ITP 中已无 Claude/Anthropic 存储，但 Safari 历史记录或图标缓存仍保留过往访问记录。",
-                "可在 Safari History 中搜索 claude / anthropic 删除对应历史，或使用全新 Safari Profile。",
-            )
-        )
-    else:
-        checks.append(
-            make_check(
-                "safari_claude_storage",
-                "Safari 深度存储残留 (WebsiteData / ITP / DeviceIdHashSalts / 历史)",
-                "PASS",
-                f"WebsiteData / ITP / 历史均无 Claude/Anthropic 残留 (Salts={salt_cnt})",
-                "Safari WebKit 站点存储、ITP 追踪库、历史记录与图标缓存中均未检出 claude / anthropic / hcaptcha / stripe 域名。",
-            )
-        )
-
-    add_inv(
-        "Safari & 浏览器",
-        "Safari WebsiteData 站点存储",
-        "~/Library/Containers/com.apple.Safari/.../WebKit/WebsiteData/Default",
-        "保存网页版 Claude/hCaptcha/Stripe 的 LocalStorage、IndexedDB、ServiceWorker 与缓存",
-        f"残留 {len(wd_doms)} 域名: {', '.join(wd_doms)}" if wd_doms else "0 残留",
-        "FAIL" if wd_doms else "PASS",
-    )
-    add_inv(
-        "Safari & 浏览器",
-        "Safari ITP 追踪库 & DeviceIdHashSalts",
-        "~/Library/Containers/com.apple.Safari/.../WebsiteData/{ResourceLoadStatistics, DeviceIdHashSalts}",
-        "WebKit 跨站追踪统计表与按站点派生的设备 ID 哈希盐",
-        (f"ITP 含 {', '.join(itp_doms)}; " if itp_doms else "ITP 0 残留; ") + f"Salts={salt_cnt} 文件",
-        "FAIL" if itp_doms else "INFO",
-    )
-    add_inv(
-        "Safari & 浏览器",
-        "Safari 历史记录 & Favicon 缓存",
-        "~/Library/Safari/{History.db, Favicon Cache}",
-        "记录曾访问的 claude.ai / anthropic.com 域名与图标缓存（仅统计匹配域名数）",
-        f"历史 {sum(hist_doms.values())} 条 ({len(hist_doms)} 域名), Favicon {len(fav_doms)} 域名" if (hist_doms or fav_doms) else "0 残留",
-        "WARN" if (hist_doms or fav_doms) else "PASS",
-    )
-
-    # 7. Safari Cookies, Locale, Private Relay, Extensions & Search History (metadata/count only)
-    safari_cookie = os.path.expanduser("~/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies")
-    safari_plist = os.path.expanduser("~/Library/Containers/com.apple.Safari/Data/Library/Preferences/com.apple.Safari.plist")
-    safari_ext_dir = os.path.expanduser("~/Library/Containers/com.apple.Safari/Data/Library/Safari/WebExtensions")
-    safari_notes: List[str] = []
-    safari_status = "INFO"
-    if os.path.isfile(safari_cookie):
-        sz = os.path.getsize(safari_cookie)
-        safari_notes.append(f"Cookies.binarycookies ({_fmt_bytes(sz)})")
-        safari_status = "WARN"
-    else:
-        safari_notes.append("无 Cookies.binarycookies")
-
-    if os.path.isdir(safari_ext_dir):
-        try:
-            ext_cnt = len([x for x in os.listdir(safari_ext_dir) if not x.startswith(".")])
-            if ext_cnt:
-                safari_notes.append(f"WebExtensions={ext_cnt} 个")
-        except Exception:
-            pass
-
-    if os.path.isfile(safari_plist):
-        try:
-            with open(safari_plist, "rb") as f:
-                sp = plistlib.load(f)
-            searches = sp.get("RecentWebSearches") or []
-            cjk_search_cnt = sum(
-                1 for item in searches if isinstance(item, dict) and has_cjk(str(item.get("SearchString", "")))
-            )
-            if cjk_search_cnt:
-                safari_notes.append(f"历史搜索中含 {cjk_search_cnt} 条中文记录")
-                safari_status = "WARN"
-            safari_loc = sp.get("WBSOfflineSearchSuggestionsModelLastUsedLocaleIdentifierKey") or ""
-            if not safari_loc:
-                def _find_loc(obj: Any) -> str:
-                    if isinstance(obj, dict):
-                        if isinstance(obj.get("Locale"), str):
-                            return obj["Locale"]
-                        for v in obj.values():
-                            r = _find_loc(v)
-                            if r:
-                                return r
-                    return ""
-                safari_loc = _find_loc(sp)
-            if safari_loc:
-                safari_notes.append(f"Safari Locale={safari_loc}")
-                if safari_loc.lower().startswith("zh_cn") or "zh-hans" in safari_loc.lower():
-                    safari_status = "FAIL"
-            relay_active = (
-                sp.get("WBSPrivacyProxyAvailabilityActiveOnDefaultNetwork") == 1
-                or sp.get("WBSPrivacyProxyAvailabilityServiceStatus") == 1
-            )
-            if relay_active:
-                safari_notes.append("iCloud Private Relay=已开启(将路由至 Apple 独立出口)")
-                safari_status = "FAIL"
-            else:
-                safari_notes.append("iCloud Private Relay=未开启")
-        except Exception:
-            pass
-
-    safari_sev = "critical" if ("iCloud Private Relay=已开启" in " ".join(safari_notes) or safari_status == "FAIL") else "low"
-    safari_fix = (
-        "关闭系统设置 -> Apple ID -> iCloud -> Private Relay（否则 Safari 出口 IP 会与 Clash 节点分叉），并在 Safari Manage Website Data 清理 claude / anthropic / hcaptcha / stripe。"
-        if safari_sev == "critical"
-        else "Safari -> Settings -> Privacy -> Manage Website Data 移除 claude / anthropic / hcaptcha / stripe，或直接为新号创建全新 Safari Profile。"
-    )
-    checks.append(
-        make_check(
-            "safari_residue",
-            "Safari Cookie 文件、Locale、Private Relay 与搜索痕迹",
-            safari_status,
-            "；".join(safari_notes),
-            "出于隐私保护不解包读取 Cookies.binarycookies 明文；上方已通过 WebKit WebsiteData 与 ITP 精准定位 Claude 站点残留。若开启 iCloud Private Relay 会导致 Safari 与本机出口 IP 分叉。",
-            safari_fix,
-            severity=safari_sev,
-        )
-    )
-    add_inv(
-        "Safari & 浏览器",
-        "Safari Cookies & Private Relay",
-        "~/Library/Containers/com.apple.Safari/.../{Cookies.binarycookies, com.apple.Safari.plist}",
-        "二进制 Cookie 容器、Safari 区域设置与 iCloud 专用代理状态（不读 Cookie 明文）",
-        "；".join(safari_notes),
-        safari_status,
-    )
-
-    # 8. Other Browsers Audit (Chromium family + Firefox / Orion / Opera / Zen)
-    chromium_dirs = {
-        "Chrome": os.path.expanduser("~/Library/Application Support/Google/Chrome"),
-        "Chrome Canary": os.path.expanduser("~/Library/Application Support/Google/Chrome Canary"),
-        "Chromium": os.path.expanduser("~/Library/Application Support/Chromium"),
-        "Brave": os.path.expanduser("~/Library/Application Support/BraveSoftware/Brave-Browser"),
-        "Edge": os.path.expanduser("~/Library/Application Support/Microsoft Edge"),
-        "Arc": os.path.expanduser("~/Library/Application Support/Arc/User Data"),
-        "Vivaldi": os.path.expanduser("~/Library/Application Support/Vivaldi"),
-        "Opera": os.path.expanduser("~/Library/Application Support/com.operasoftware.Opera"),
-    }
-    other_non_chromium = {
-        "Firefox": os.path.expanduser("~/Library/Application Support/Firefox"),
-        "Orion": os.path.expanduser("~/Library/Application Support/Orion"),
-        "Zen": os.path.expanduser("~/Library/Application Support/zen"),
-    }
-    found_browsers: List[str] = []
-    browser_issues: List[str] = []
-    for bname, bpath in chromium_dirs.items():
-        if not os.path.isdir(bpath):
-            continue
-        ls_file = os.path.join(bpath, "Local State")
-        b_tags: List[str] = []
-        if os.path.isfile(ls_file):
-            try:
-                ls = json.load(open(ls_file, "r", encoding="utf-8"))
-                vc = ls.get("variations_country")
-                doh = (ls.get("dns_over_https") or {}).get("mode")
-                if vc:
-                    b_tags.append(f"variations={vc}")
-                    if str(vc).lower() in {"cn", "hk"}:
-                        browser_issues.append(f"{bname} variations_country={vc}")
-                if doh:
-                    b_tags.append(f"DoH={doh}")
-            except Exception:
-                pass
-        # Check Default + Profile * directories
-        prof_dirs = [
-            os.path.join(bpath, d)
-            for d in sorted(os.listdir(bpath))
-            if (d == "Default" or d.startswith("Profile ")) and os.path.isdir(os.path.join(bpath, d))
-        ]
-        claude_cookie_hosts = set()
-        for pdir in prof_dirs[:5]:
-            pref_file = os.path.join(pdir, "Preferences")
-            if os.path.isfile(pref_file):
-                try:
-                    pr = json.load(open(pref_file, "r", encoding="utf-8"))
-                    acc = (pr.get("intl") or {}).get("accept_languages")
-                    rtc_pol = (pr.get("webrtc") or {}).get("ip_handling_policy")
-                    if acc and not any(t.startswith("lang=") for t in b_tags):
-                        b_tags.append(f"lang={acc}")
-                    if acc and "zh-cn" in str(acc).lower():
-                        browser_issues.append(f"{bname}({os.path.basename(pdir)}) accept_languages 含 zh-CN")
-                    if rtc_pol and not any(t.startswith("webrtc=") for t in b_tags):
-                        b_tags.append(f"webrtc={rtc_pol}")
-                except Exception:
-                    pass
-            ck_file = os.path.join(pdir, "Cookies")
-            if os.path.isfile(ck_file):
-                tmp = tempfile.mktemp(suffix=".db")
-                try:
-                    shutil.copy2(ck_file, tmp)
-                    conn = sqlite3.connect(tmp)
-                    rows = conn.execute("SELECT DISTINCT host_key FROM cookies").fetchall()
-                    conn.close()
-                    for (hk,) in rows:
-                        if _match_claude_risk_domain(str(hk).lstrip(".")):
-                            claude_cookie_hosts.add(str(hk).lstrip("."))
-                except Exception:
-                    pass
-                finally:
-                    if os.path.exists(tmp):
-                        os.remove(tmp)
-        if claude_cookie_hosts:
-            b_tags.append(f"含Claude/风控Cookie({len(claude_cookie_hosts)}域)")
-            browser_issues.append(f"{bname} Cookies 含 {', '.join(sorted(claude_cookie_hosts)[:4])}")
-        found_browsers.append(f"{bname}({', '.join(b_tags) if b_tags else '已安装'})")
-
-    for bname, bpath in other_non_chromium.items():
-        if os.path.isdir(bpath):
-            found_browsers.append(f"{bname}(已安装)")
-
-    if not found_browsers:
-        checks.append(
-            make_check(
-                "other_browsers",
-                "其他浏览器残留与配置扫描 (Chrome/Arc/Brave/Edge/Firefox)",
-                "PASS",
-                "未安装其他浏览器 (0 残留)",
-                "本机仅使用 Safari，不存在 Chrome/Arc/Brave/Edge/Firefox 残留旧 Claude Cookie 或 DoH 冲突。",
-            )
-        )
-        add_inv("Safari & 浏览器", "其他浏览器 (Chrome/Arc/Brave/Edge/Firefox)", "~/Library/Application Support/{Google/Chrome, Arc, Brave, Edge, Firefox...}", "扫描跨浏览器语言、DoH、WebRTC 策略与 Claude/hCaptcha Cookie 域名", "未安装 (0 残留)", "PASS")
-    else:
-        checks.append(
-            make_check(
-                "other_browsers",
-                "其他浏览器残留与配置扫描 (Chrome/Arc/Brave/Edge/Firefox)",
-                "WARN" if browser_issues else "PASS",
-                " | ".join(found_browsers),
-                f"发现语言/Cookie 残留风险: {'; '.join(browser_issues)}" if browser_issues else "已安装的其他浏览器未发现中文地区配置或 Claude Cookie 残留。",
-                "若在这些浏览器登录过旧 Claude 账号，请新建干净 Profile 或清理对应站点数据。" if browser_issues else "",
-            )
-        )
-        add_inv("Safari & 浏览器", "其他浏览器 (Chrome/Arc/Brave/Edge/Firefox)", "~/Library/Application Support/{Chrome, Arc, Brave, Edge, Firefox...}", "扫描跨浏览器语言、DoH、WebRTC 策略与 Claude/hCaptcha Cookie 域名", " | ".join(found_browsers), "WARN" if browser_issues else "PASS")
-
-    return {"title": "Claude 全路径文件与浏览器残留", "checks": checks, "inventory": inventory}
+    return mac_platform.mac_audit_claude_browser_residue(run_cmd)
 
 
 # ---------------------------------------------------------------------------
@@ -3630,7 +1398,33 @@ def _audit_linux_residue_basic() -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Full Scan Orchestrator
 # ---------------------------------------------------------------------------
+_SCAN_LOCK = threading.Lock()
+_SCAN_FLIGHTS: Dict[str, concurrent.futures.Future] = {}
+
+
 def run_full_scan(target_code: str) -> Dict[str, Any]:
+    target_code = target_code.upper() if target_code.upper() in TARGETS else "US"
+    with _SCAN_LOCK:
+        flight = _SCAN_FLIGHTS.get(target_code)
+        owner = flight is None
+        if owner:
+            flight = concurrent.futures.Future()
+            _SCAN_FLIGHTS[target_code] = flight
+    if not owner:
+        return flight.result()
+    try:
+        result = _run_full_scan(target_code)
+        flight.set_result(result)
+        return result
+    except BaseException as exc:
+        flight.set_exception(exc)
+        raise
+    finally:
+        with _SCAN_LOCK:
+            _SCAN_FLIGHTS.pop(target_code, None)
+
+
+def _run_full_scan(target_code: str) -> Dict[str, Any]:
     t0 = time.monotonic()
     target_code = target_code.upper()
     if target_code not in TARGETS:
@@ -3640,6 +1434,8 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
     cf_domains = [
         "claude.ai",
         "api.anthropic.com",
+        "assets.claude.ai",
+        "downloads.claude.ai",
         "a-api.anthropic.com",
         "console.anthropic.com",
         "platform.claude.com",
@@ -3649,6 +1445,7 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
         "challenges.cloudflare.com",
     ]
 
+    payment_observer = PaymentRouteObserver().start() if IS_MACOS else None
     with concurrent.futures.ThreadPoolExecutor(max_workers=44) as pool:
         # Phase A: immediate parallel launch
         f_primary = pool.submit(_trace_domain, "claude.ai")
@@ -3673,8 +1470,8 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
             ("hCaptcha API", "https://api.hcaptcha.com/", "critical"),
             ("hCaptcha Assets", "https://newassets.hcaptcha.com/", "critical"),
             ("CF Turnstile", "https://challenges.cloudflare.com/turnstile/v0/api.js", "critical"),
-            ("Anthropic Statsig", "https://statsig.anthropic.com/", "critical"),
-            ("Claude Model Catalog", "https://downloads.claude.ai/model-catalog/v1/catalog.json", "critical"),
+            ("Anthropic Statsig (旧版)", "https://statsig.anthropic.com/", "legacy"),
+            ("Claude Model Catalog", "https://downloads.claude.ai/model-catalog/v1/catalog.json", "telemetry"),
             ("Claude Portal", "https://claude.com/", "critical"),
             ("Google OAuth", "https://accounts.google.com/Generate204", "critical"),
             ("Apple OAuth", "https://appleid.apple.com/", "critical"),
@@ -3761,6 +1558,10 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
         edge_res = f_edge.result()
         split_dns_res = f_split_dns.result()
         tp_results = [edge_res] + [fut.result() for _, fut in f_tp]
+        payment_routes = payment_observer.finish() if payment_observer else {}
+        for row in tp_results:
+            if row["domain"] in payment_routes:
+                row["route"] = payment_routes[row["domain"]]
 
         win_tun_details: Optional[Dict[str, Any]] = None
         if f_win_tun is not None:
@@ -4154,24 +1955,27 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
     leak_checks: List[Dict[str, str]] = []
     domain_matrix = domain_rows + cn_rows
 
-    cf_ok = [r for r in domain_rows if r["ok"]]
+    cf_ok = [r for r in domain_rows if r["ok"] and r.get("ip") and r.get("loc")]
+    no_trace = [r["domain"] for r in domain_rows if r.get("reachable") and not r.get("trace_available")]
+    cf_bad = [r for r in domain_rows if r["domain"] not in no_trace and
+              (not r["ok"] or r.get("loc") != target_cfg["code"])]
     cf_ips = {r["ip"] for r in cf_ok if r["ip"]}
     cf_locs = {r["loc"] for r in cf_ok if r["loc"]}
-    if len(cf_ok) == len(domain_rows) and len(cf_ips) == 1 and cf_locs == {target_cfg["code"]}:
+    if not cf_bad and len(cf_ips) == 1 and cf_locs == {target_cfg["code"]}:
         leak_checks.append(
             make_check(
                 "domain_consistency",
                 "Anthropic / Cloudflare 全域名出口一致性",
-                "PASS",
-                f"{len(cf_ok)}/{len(domain_rows)} 域名统一经 {next(iter(cf_ips))} ({target_cfg['code']})",
-                "claude.ai、api.anthropic.com、platform.claude.com、challenges.cloudflare.com 等全部走同一目标出口。",
+                "INFO" if no_trace else "PASS",
+                f"{len(cf_ok)}/{len(domain_rows)} 域名已核验经 {next(iter(cf_ips))} ({target_cfg['code']})",
+                "已返回 trace 的域名出口一致。" + ("以下域名未提供 trace，无法核验出口：" + "、".join(no_trace) if no_trace else "全部域名均已核验。"),
             )
         )
     else:
         bad_doms = [
             f"{r['domain']}({r.get('loc') or r.get('error')})"
             for r in domain_rows
-            if not r["ok"] or r.get("loc") != target_cfg["code"]
+            if r["domain"] not in no_trace and (not r["ok"] or r.get("loc") != target_cfg["code"])
         ]
         leak_checks.append(
             make_check(
@@ -4180,7 +1984,7 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
                 "FAIL",
                 f"存在分流/失败域名: {', '.join(bad_doms) if bad_doms else f'多出口 IP {cf_ips}'}",
                 "部分 Anthropic 或 Cloudflare 域名未走同一目标节点，会导致服务端与验证服务看到不同 IP/国家。",
-                "确保所有 anthropic.com / claude.ai / claude.com / cloudflare.com / stripe.com / stripe.network / hcaptcha.com / statsig.anthropic.com 走同一节点。",
+                "核对 Anthropic 与验证服务的分流规则；Stripe 专用 VPN 路由由支付分流项单独核验。",
             )
         )
 
@@ -4276,52 +2080,8 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
             )
         )
 
-    # Claude login edge gate & Third-party payment/CAPTCHA/telemetry endpoints
-    if edge_res.get("blocked"):
-        leak_checks.append(
-            make_check(
-                "claude_edge_gate",
-                "Claude 登录边缘地区准入实测 (claude.ai/login)",
-                "FAIL",
-                f"拦截重定向: {edge_res.get('redirect_url') or edge_res.get('http_code')}",
-                "访问 https://claude.ai/login 直接触发地区不可用重定向/403！",
-                "更换目标支持地区的干净节点并清理本地指纹。",
-                severity="critical",
-            )
-        )
-    elif edge_res.get("cf_challenge"):
-        leak_checks.append(
-            make_check(
-                "claude_edge_gate",
-                "Claude 登录边缘地区准入实测 (claude.ai/login)",
-                "WARN",
-                f"HTTP 403 · cf-mitigated: challenge ({edge_res.get('latency_ms')}ms)",
-                "未触发 app-unavailable-in-region 地区拦截重定向，但当前 IP 对无 Cookie 请求触发了 Cloudflare 人机盾挑战（若真实浏览器下也频繁弹盾，说明该 IP 信誉一般）。",
-                severity="low",
-            )
-        )
-    elif not edge_res.get("ok"):
-        leak_checks.append(
-            make_check(
-                "claude_edge_gate",
-                "Claude 登录边缘地区准入实测 (claude.ai/login)",
-                "FAIL",
-                edge_res.get("error", "请求失败"),
-                "无法正常触达 https://claude.ai/login 登录入口。",
-                "检查代理节点连通性。",
-                severity="high",
-            )
-        )
-    else:
-        leak_checks.append(
-            make_check(
-                "claude_edge_gate",
-                "Claude 登录边缘地区准入实测 (claude.ai/login)",
-                "PASS",
-                f"HTTP {edge_res.get('http_code')} ({edge_res.get('latency_ms')}ms)",
-                "claude.ai/login 入口响应正常，未触发 app-unavailable-in-region 地区拦截重定向。",
-            )
-        )
+    # Classify public responses without inferring region or bans from HTTP 403.
+    leak_checks.append(edge_gate_check(edge_res))
 
     # Proxy chain latency / multi-hop RTT audit
     ok_latencies = [float(r["latency_ms"]) for r in domain_rows if r.get("ok") and r.get("latency_ms")]
@@ -4335,7 +2095,7 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
                     "代理链路延迟与超时风险",
                     "WARN",
                     f"平均 {avg_ms} ms (峰值 {max_ms} ms)",
-                    "链路 RTT 过高（>2500ms），极易导致 Stripe.js、hCaptcha 与 TLS 握手超时，也常意味着多重中转。",
+                    "完整 HTTP 探测平均耗时超过 2500ms（包含 DNS、建连、TLS 与服务器响应，并非 RTT）；可能影响资源加载，不能据此断言存在多重中转。",
                     "建议更换直连延迟更低、链路更稳定的节点。",
                     severity="high",
                 )
@@ -4364,25 +2124,26 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
 
     tp_only = tp_results[1:]
     crit_fail = [r for r in tp_only if not r["ok"] and r.get("category") == "critical"]
-    tele_fail = [r for r in tp_only if not r["ok"] and r.get("category") != "critical"]
-    ok_tp_cnt = sum(1 for r in tp_only if r["ok"])
+    tele_fail = [r for r in tp_only if not r["ok"] and r.get("category") == "telemetry"]
+    required_tp = [r for r in tp_only if r.get("category") != "legacy"]
+    ok_tp_cnt = sum(1 for r in required_tp if r["ok"])
     tp_summary = "；".join(f"{r['name']}:{r['http_code'] or 'ERR'}({r['latency_ms']}ms)" for r in tp_only)
     if crit_fail:
         leak_checks.append(
             make_check(
                 "third_party_endpoints",
-                "第三方风控 / 支付 / Statsig / 人机验证接口连通性",
+                "第三方支付 / 人机验证接口连通性",
                 "FAIL",
                 f"关键接口异常 {len(crit_fail)} 项 ({', '.join(r['name'] for r in crit_fail)})",
-                f"{tp_summary}。Stripe / m.stripe.network / hCaptcha / Statsig / OAuth 加载失败会直接导致支付风控拒付或人机验证失败。",
-                "检查节点链路质量或分流规则，确保 stripe.com、stripe.network、hcaptcha.com、statsig.anthropic.com、challenges.cloudflare.com 畅通。",
+                f"{tp_summary}。必需资源不可达可能影响登录、支付或人机验证；探测结果不能判定实际交易是否获批。",
+                "检查节点链路质量或分流规则，确保 stripe.com、stripe.network、hcaptcha.com、challenges.cloudflare.com 畅通。",
             )
         )
     elif tele_fail:
         leak_checks.append(
             make_check(
                 "third_party_endpoints",
-                "第三方风控 / 支付 / Statsig / 人机验证接口连通性",
+                "第三方支付 / 人机验证接口连通性",
                 "WARN",
                 f"遥测/客服接口异常 ({', '.join(r['name'] for r in tele_fail)})",
                 tp_summary,
@@ -4392,12 +2153,19 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
         leak_checks.append(
             make_check(
                 "third_party_endpoints",
-                "第三方风控 / 支付 / Statsig / 人机验证接口连通性",
+                "第三方支付 / 人机验证接口连通性",
                 "PASS",
-                f"{ok_tp_cnt}/{len(tp_only)} 第三方风控与支付域名全通",
-                tp_summary,
+                f"{ok_tp_cnt}/{len(required_tp)} 第三方支付与验证接口可达",
+                tp_summary + "。只读 HTTP 探测（含无凭据根路径的 4xx 响应）仅验证服务响应，不代表支付成功；路由见支付分流项。",
             )
         )
+
+    for row in tp_only:
+        if row.get("category") == "legacy" and not row["ok"]:
+            leak_checks.append(make_check("legacy_statsig", "旧版 Statsig 辅助域名", row["status"],
+                                          row["note"], row["error"]))
+    if IS_MACOS:
+        leak_checks.append(payment_route_check(payment_routes))
 
     # CN IP split routing check
     cn_ips = [r["ip"] for r in cn_rows if r.get("ip")]
@@ -4669,8 +2437,8 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
                     "TUN 隧道与断流保护 (Kill-Switch) 风险",
                     "WARN",
                     f"TUN 活跃 ({', '.join(utun_ips)})，但底层网卡仍有默认路由/私网 DNS",
-                    f"存在物理网卡默认路由 {non_utun_defaults} 及 Scoped DNS {scutil_info.get('scoped_private_dns')}。平时走 TUN 没问题，但系统休眠唤醒或 Clash 重载瞬间，后台客户端会立刻走物理网卡直连漏出真实 IP！",
-                    "休眠前先退出 Claude Desktop，或确保 Clash 开启严格的断网保护规则。",
+                    f"存在物理网卡备用路由 {non_utun_defaults} 及 Scoped DNS {scutil_info.get('scoped_private_dns')}。它们与 macOS TUN 并存属于常见配置，不能据此断言正在泄漏；隧道断开后的系统级阻断尚未验证。进程保护与系统防火墙阻断是不同机制。",
+                    "保持后台进程保护开启；如需系统级断隧道阻断，请核验代理客户端的断网保护能力。",
                 )
             )
         else:
@@ -4775,65 +2543,144 @@ def run_full_scan(target_code: str) -> Dict[str, Any]:
     }
 
 
+RUN_MODE = "cli"
+NATIVE_READY = False
+PREFS_DEFAULTS = {"target": "US", "interval_sec": 30, "auto_start_monitor": True, "notify_enabled": True,
+                  "protection_enabled": IS_MACOS, "local_interval_ms": 100}
+_PREFS_LOCK = threading.RLock()
+_PREFS = dict(PREFS_DEFAULTS)
+PULSE_LOCK = threading.Lock()
+PROTECTION_HISTORY = collections.deque(maxlen=100)
+PROTECTION_HISTORY_LOCK = threading.Lock()
+PROTECTION_LOG_PATH = os.path.join(USER_DATA_DIR, "protection-events.jsonl")
+
+
+def _atomic_write(path: str, text: str) -> None:
+    """Only our own runtime files. Never write inside the signed bundle."""
+    fd, temporary = tempfile.mkstemp(prefix=".regionguard-", dir=os.path.dirname(path))
+    try:
+        if not IS_WINDOWS:
+            os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)  # only the temporary file this call created
+
+
+def _validate_prefs(changes):
+    if not isinstance(changes, dict) or any(key not in PREFS_DEFAULTS for key in changes):
+        raise ValueError("unknown preference")
+    result = dict(changes)
+    if "target" in result:
+        if not isinstance(result["target"], str) or result["target"].upper() not in TARGETS:
+            raise ValueError("invalid target")
+        result["target"] = result["target"].upper()
+    if "interval_sec" in result and (type(result["interval_sec"]) is not int or result["interval_sec"] not in {15, 30, 60}):
+        raise ValueError("interval must be 15, 30 or 60")
+    if "local_interval_ms" in result and (type(result["local_interval_ms"]) is not int or result["local_interval_ms"] not in {50, 100, 250, 500}):
+        raise ValueError("local interval must be 50, 100, 250 or 500 ms")
+    for key in ("auto_start_monitor", "notify_enabled", "protection_enabled"):
+        if key in result and type(result[key]) is not bool:
+            raise ValueError("preference must be boolean")
+    return result
+
+
+def _load_prefs():
+    global _PREFS
+    values = dict(PREFS_DEFAULTS)
+    try:
+        from audit_common import read_json
+        loaded = read_json(PREFS_PATH, 65536)
+        for key in PREFS_DEFAULTS:
+            if key in loaded:
+                try:
+                    values.update(_validate_prefs({key: loaded[key]}))
+                except ValueError:
+                    pass
+    except (OSError, ValueError, TypeError):
+        pass
+    with _PREFS_LOCK:
+        _PREFS = values
+    return get_prefs()
+
+
+def get_prefs():
+    with _PREFS_LOCK:
+        return {**_PREFS, "run_mode": RUN_MODE}
+
+
+def update_prefs(changes):
+    changes = _validate_prefs(changes)
+    with _PREFS_LOCK:
+        values = {**_PREFS, **changes}
+        _atomic_write(PREFS_PATH, json.dumps(values, ensure_ascii=False))
+        _PREFS.update(values)
+        MONITOR.configure(values["target"], values["interval_sec"], emit=False)
+    MONITOR._emit()
+    return get_prefs()
+
+
 def _load_pulse_history() -> None:
     global BASELINE_IP
-    if not os.path.isfile(PULSE_LOG_PATH):
-        return
     try:
-        with open(PULSE_LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
-            lines = f.read().splitlines()
-        loaded: List[Dict[str, Any]] = []
-        for line in lines[-200:]:
-            if not line.strip():
-                continue
-            try:
-                obj = json.loads(line)
-                if isinstance(obj, dict):
-                    loaded.append(obj)
-            except Exception:
-                pass
+        with open(PULSE_LOG_PATH, "r", encoding="utf-8", errors="replace") as handle:
+            lines = handle.read(2 * 1024 * 1024).splitlines()
         with HISTORY_LOCK:
             PULSE_HISTORY.clear()
-            for item in loaded:
-                PULSE_HISTORY.append(item)
-                if BASELINE_IP is None and item.get("ok") and item.get("ip") and item.get("ip") != "-":
-                    BASELINE_IP = item["ip"]
-    except Exception:
+            BASELINE_IP = None
+            for line in lines[-500:]:
+                try:
+                    event = json.loads(line)
+                    if isinstance(event, dict) and isinstance(event.get("timestamp"), str):
+                        PULSE_HISTORY.append(event)
+                        if BASELINE_IP is None and event.get("ok"):
+                            BASELINE_IP = event.get("ip")
+                except (ValueError, TypeError):
+                    pass
+    except OSError:
         pass
 
 
 def _append_pulse_log(event: Dict[str, Any]) -> None:
+    # Called under HISTORY_LOCK after appending; never reload an unbounded log.
     try:
-        line = json.dumps(event, ensure_ascii=False)
-        existing: List[str] = []
-        if os.path.isfile(PULSE_LOG_PATH):
-            with open(PULSE_LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
-                existing = f.read().splitlines()
-        existing.append(line)
-        if len(existing) > 500:
-            existing = existing[-500:]
-        with open(PULSE_LOG_PATH, "w", encoding="utf-8") as f:
-            f.write("\n".join(existing) + "\n")
-    except Exception:
+        _atomic_write(PULSE_LOG_PATH, "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in PULSE_HISTORY))
+    except OSError:
         pass
 
 
 def _clear_pulse_log() -> None:
     try:
-        if os.path.isfile(PULSE_LOG_PATH):
-            os.remove(PULSE_LOG_PATH)
-    except Exception:
+        _atomic_write(PULSE_LOG_PATH, "")
+    except OSError:
         pass
 
 
 def run_pulse(target_code: str, wake_detected: bool = False) -> Dict[str, Any]:
+    with PULSE_LOCK:
+        started_at = time.monotonic()
+        result = _run_pulse(target_code, wake_detected)
+    MONITOR.observe_pulse(result["event"], started_at)
+    MONITOR.publish()
+    return result
+
+
+def _run_pulse(target_code: str, wake_detected: bool = False) -> Dict[str, Any]:
     global BASELINE_IP
     target_code = target_code.upper()
     if target_code not in TARGETS:
         target_code = "SG"
 
     trace = _trace_domain("claude.ai")
-    utun_up, utun_ips, _, _ = _check_tun_cross_platform()
+    fast = MONITOR.protection.status() if MONITOR.protection is not None else {}
+    if IS_MACOS and fast.get("running") and fast.get("enabled") and fast.get("last_check_age_ms") is not None and fast["last_check_age_ms"] < 1000:
+        utun_up, utun_ips = fast.get("local_safe") is True, fast.get("interfaces", [])
+    else:
+        utun_up, utun_ips, _, _ = _check_tun_cross_platform()
 
     ip = trace.get("ip", "")
     loc = trace.get("loc", "").upper()
@@ -4841,18 +2688,18 @@ def run_pulse(target_code: str, wake_detected: bool = False) -> Dict[str, Any]:
     ok = bool(trace.get("ok") and ip)
 
     with HISTORY_LOCK:
-        prev = PULSE_HISTORY[-1] if PULSE_HISTORY else None
+        prev = next((e for e in reversed(PULSE_HISTORY) if e.get("target") == target_code), None)
         if BASELINE_IP is None and ok:
             BASELINE_IP = ip
         changed_ip = bool(prev and prev.get("ip") and prev["ip"] != "-" and ip and prev["ip"] != ip)
         changed_loc = bool(prev and prev.get("loc") and prev["loc"] != "-" and loc and prev["loc"] != loc)
         anomaly_reasons: List[str] = []
-        if wake_detected:
-            anomaly_reasons.append("检测到系统休眠唤醒跳变")
         if not ok:
             anomaly_reasons.append(f"连接失败({trace.get('error', 'err')})")
         elif loc != target_code:
             anomaly_reasons.append(f"地区不匹配({loc} != {target_code})")
+        if loc in RESTRICTED_COUNTRIES or colo in RESTRICTED_COLOS:
+            anomaly_reasons.append("出口进入受限地区")
         if not utun_up:
             anomaly_reasons.append("TUN隧道离线")
         if changed_ip:
@@ -4883,97 +2730,237 @@ def run_pulse(target_code: str, wake_detected: bool = False) -> Dict[str, Any]:
     return {"event": event, "history_count": hist_count, "baseline_ip": baseline}
 
 
-class MonitorController:
-    """Autonomous background pulse monitor surviving browser tab close & capturing wake leaks."""
+def _wake_gap(wall_delta, mono_delta, interval):
+    return (wall_delta - mono_delta) > 8.0 or wall_delta > (interval + 15)
 
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
+
+class MonitorController:
+    """One worker, independent listeners, shared target/interval and dual-clock wake checks."""
+    def __init__(self, protection=None, traffic=None, version_observer=None):
+        self.protection = protection
+        self.traffic = traffic
+        self.version_observer = version_observer
+        if protection is not None:
+            protection.set_callback(self._on_protection_event)
+        self._wake_requested = False
+        self._lock = threading.RLock()
+        self._lifecycle = threading.Lock()
         self._running = False
-        self._target = "SG"
+        self._target = "US"
         self._interval_sec = 30
         self._stop_event = threading.Event()
-        self._thread: Optional[threading.Thread] = None
+        self._reconfigure = threading.Event()
+        self._thread = None
+        self._listeners = []
+        self._error = ""
+        self._traffic_error = ""
 
-    def start(self, target_code: str = "SG", interval_sec: int = 30) -> Dict[str, Any]:
-        target_code = target_code.upper()
-        if target_code not in TARGETS:
-            target_code = "SG"
-        interval_sec = max(10, min(300, int(interval_sec)))
-
-        with self._lock:
-            if self._running and self._thread and self._thread.is_alive():
-                self._stop_event.set()
-                old_thread = self._thread
-            else:
-                old_thread = None
-
-        if old_thread is not None:
-            old_thread.join(timeout=2.0)
-
-        with self._lock:
-            self._target = target_code
-            self._interval_sec = interval_sec
-            self._stop_event = threading.Event()
-            self._running = True
-            self._thread = threading.Thread(target=self._loop, args=(self._stop_event,), daemon=True)
-            self._thread.start()
-        return self.status()
-
-    def stop(self) -> Dict[str, Any]:
-        with self._lock:
-            self._running = False
-            self._stop_event.set()
-            th = self._thread
-        if th is not None and th.is_alive():
-            th.join(timeout=2.0)
-        return self.status()
-
-    def _loop(self, stop_evt: threading.Event) -> None:
-        last_tick = time.time()
-        first = True
-        while not stop_evt.is_set():
-            with self._lock:
-                target = self._target
-                interval = self._interval_sec
-            now_wall = time.time()
-            wake_detected = (not first) and ((now_wall - last_tick) > (interval + 15))
-            first = False
+    def _on_protection_event(self, snapshot):
+        # Runs on a separate dispatch thread, never on the 100ms critical path.
+        with PROTECTION_HISTORY_LOCK:
+            PROTECTION_HISTORY.append({"timestamp": now_iso(), **snapshot})
+            text = "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in PROTECTION_HISTORY)
             try:
-                run_pulse(target, wake_detected=wake_detected)
-                if wake_detected and not stop_evt.wait(2.0):
+                _atomic_write(PROTECTION_LOG_PATH, text)
+            except OSError:
+                pass
+        if snapshot.get("local_safe") and any(code in snapshot.get("reason_codes", []) for code in ("route_pending", "wake_pending", "telemetry_pending")):
+            self._reconfigure.set()
+        self._emit(protection_event=snapshot)
+
+    def observe_pulse(self, event, started_at):
+        if self.protection is not None:
+            self.protection.observe_pulse(event, started_at)
+
+    def on_wake(self):
+        with self._lock:
+            if not self._running:
+                return
+            self._wake_requested = True
+            self._reconfigure.set()
+        if self.protection is not None:
+            self.protection.on_wake()
+        if self.traffic is not None:
+            try:
+                self.traffic.invalidate()
+            except Exception:
+                self._traffic_error = '连接观察状态待复核'
+
+    def register_listener(self, callback):
+        with self._lock:
+            if callback not in self._listeners:
+                self._listeners.append(callback)
+        def unregister():
+            with self._lock:
+                if callback in self._listeners:
+                    self._listeners.remove(callback)
+        return unregister
+
+    def publish(self):
+        with self._lock:
+            self._error = ""
+        self._emit()
+
+    def _emit(self, protection_event=None):
+        snapshot = self.status()
+        if protection_event is not None:
+            # Preserve the exact transition/action for notifications even if the
+            # current fast state has already recovered by the time callbacks run.
+            snapshot["protection_event"] = protection_event
+        with self._lock:
+            callbacks = tuple(self._listeners)
+        for callback in callbacks:
+            try:
+                callback(snapshot)
+            except Exception:
+                pass  # a UI listener cannot terminate the monitor
+
+    def configure(self, target, interval, emit=True):
+        with self._lock:
+            changed = self._target != target or self._interval_sec != interval
+            self._target, self._interval_sec = target, interval
+            if changed:
+                self._reconfigure.set()
+        if self.protection is not None:
+            prefs = get_prefs()
+            previous_protection = self.protection.status()
+            if self.traffic is not None and prefs['protection_enabled'] and not previous_protection.get('enabled'):
+                # A purely observational period must not arm old action evidence.
+                try:
+                    self.traffic.invalidate(clear_actions=True)
+                except Exception:
+                    self._traffic_error = '连接观察状态待复核'
+            self.protection.configure(target, prefs["protection_enabled"], prefs["local_interval_ms"], interval)
+            if (prefs["protection_enabled"] and not previous_protection.get("enabled")
+                    and previous_protection.get("supported", True)):
+                self._reconfigure.set()  # enabling protection must not wait a full public-probe interval
+        if emit:
+            self._emit()
+
+    def start(self, target_code="US", interval_sec=30):
+        values = _validate_prefs({"target": target_code, "interval_sec": interval_sec})
+        with self._lifecycle:
+            with self._lock:
+                previous = self._thread if self._stop_event.is_set() else None
+            if previous is not None and previous.is_alive():
+                previous.join(timeout=22)
+                if previous.is_alive():
+                    raise RuntimeError("previous monitor probe is still finishing")
+            with self._lock:
+                self._target, self._interval_sec = values["target"], values["interval_sec"]
+                self._running = True
+            if self.traffic is not None:
+                try:
+                    self.traffic.start()
+                    self._traffic_error = ''
+                except Exception:
+                    self._traffic_error = '后台连接观察未能启动；当前覆盖未知'
+            if self.protection is not None:
+                prefs = get_prefs()
+                try:
+                    self.protection.start(values["target"], prefs["protection_enabled"], prefs["local_interval_ms"], interval_sec)
+                except Exception:
+                    with self._lock:
+                        self._running = False
+                        self._stop_event.set()
+                        self._reconfigure.set()
+                        failed_thread = self._thread
+                    self.protection.stop()
+                    if self.traffic is not None:
+                        self.traffic.stop()
+                    if failed_thread is not None and failed_thread is not threading.current_thread():
+                        failed_thread.join(timeout=2)
+                    raise
+            with self._lock:
+                if self._thread is not None and self._thread.is_alive():
+                    self._running = True
+                    self._reconfigure.set()
+                else:
+                    self._stop_event = threading.Event()
+                    self._reconfigure = threading.Event()
+                    self._running = True
+                    self._thread = threading.Thread(target=self._loop, args=(self._stop_event,), name="rg-monitor", daemon=True)
+                    self._thread.start()
+        self._emit()
+        return self.status()
+
+    def stop(self):
+        with self._lifecycle:
+            with self._lock:
+                self._running = False
+                self._stop_event.set()
+                self._reconfigure.set()
+                thread = self._thread
+            if self.protection is not None:
+                self.protection.stop()
+            if self.traffic is not None:
+                self.traffic.stop()
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(timeout=15)
+        self._emit()
+        return self.status()
+
+    def _loop(self, stop_event):
+        last_wall, last_mono = time.time(), time.monotonic()
+        first = True
+        while not stop_event.is_set():
+            with self._lock:
+                target, interval = self._target, self._interval_sec
+                wake_requested = self._wake_requested
+                self._wake_requested = False
+                self._reconfigure.clear()
+            wall, mono = time.time(), time.monotonic()
+            wake = wake_requested or (not first and _wake_gap(wall - last_wall, mono - last_mono, interval))
+            if wake and not wake_requested and self.protection is not None:
+                self.protection.on_wake()
+            first = False
+            if self.version_observer is not None:
+                try:
+                    self.version_observer.sample()  # never blocks the 100ms action worker
+                except Exception:
+                    pass  # a version hint cannot suppress the independent public safety probe
+            try:
+                run_pulse(target, wake_detected=wake)
+                if wake and not stop_event.wait(2.0):
                     run_pulse(target, wake_detected=False)
             except Exception:
-                pass
-            last_tick = time.time()
-            if stop_evt.wait(interval):
+                with self._lock:
+                    self._error = "后台探测未完成，请重试"
+                self._emit()
+            last_wall, last_mono = time.time(), time.monotonic()
+            if stop_event.is_set():
                 break
+            self._reconfigure.wait(interval)
 
-    def status(self) -> Dict[str, Any]:
+    def status(self):
         with self._lock:
-            running = self._running and (self._thread is not None and self._thread.is_alive())
-            target = self._target
-            interval = self._interval_sec
+            running = self._running
+            target, interval, error = self._target, self._interval_sec, self._error
         with HISTORY_LOCK:
-            items = list(PULSE_HISTORY)
-            baseline = BASELINE_IP
-        anomaly_cnt = sum(1 for e in items if e.get("anomaly"))
-        jump_cnt = sum(1 for e in items if e.get("changed_ip"))
-        wake_cnt = sum(1 for e in items if e.get("wake_detected"))
-        return {
-            "running": running,
-            "target": target,
-            "interval_sec": interval,
-            "baseline_ip": baseline,
-            "total_count": len(items),
-            "anomaly_count": anomaly_cnt,
-            "jump_count": jump_cnt,
-            "wake_count": wake_cnt,
-            "latest": items[-1] if items else None,
-            "items": items,
-        }
+            items, baseline = list(PULSE_HISTORY), BASELINE_IP
+        # A previous target's result cannot paint the newly selected target green.
+        latest = next((event for event in reversed(items) if event.get("target") == target), None)
+        traffic = None
+        if self.traffic is not None:
+            try:
+                traffic = self.traffic.status()  # memory cache; no process, socket or controller IO
+            except Exception:
+                traffic = dict(running=False, state='unknown', reason_codes=['traffic_observer_unavailable'])
+        return dict(running=running, target=target, interval_sec=interval, baseline_ip=baseline,
+                    total_count=len(items), anomaly_count=sum(bool(e.get("anomaly")) for e in items),
+                    jump_count=sum(bool(e.get("changed_ip")) for e in items),
+                    wake_count=sum(bool(e.get("wake_detected")) for e in items),
+                    latest=latest, items=items, monitor_error=error, prefs=get_prefs(),
+                    protection=self.protection.status() if self.protection is not None else None,
+                    traffic=traffic, traffic_error=self._traffic_error)
 
 
-MONITOR = MonitorController()
+PROTECTOR = FastProtector(connection_provider=CLAUDE_TRAFFIC.status,
+                          connection_acknowledge=CLAUDE_TRAFFIC.acknowledge)
+MONITOR = MonitorController(protection=PROTECTOR, traffic=CLAUDE_TRAFFIC if IS_MACOS else None,
+                            version_observer=CLIENT_VERSION if IS_MACOS else None)
+_load_prefs()
+MONITOR.configure(_PREFS["target"], _PREFS["interval_sec"])
 _load_pulse_history()
 
 
@@ -4981,10 +2968,55 @@ _load_pulse_history()
 # HTTP Server (Strictly Read-Only Detection & Scoring)
 # ---------------------------------------------------------------------------
 class RegionGuardHandler(http.server.BaseHTTPRequestHandler):
-    server_version = "RegionGuard/2.0"
+    server_version = "RegionGuard/3.5.0"
 
     def log_message(self, format: str, *args: Any) -> None:
         return
+
+    def _check_request_security(self, is_post: bool = False) -> bool:
+        if self.client_address[0] not in {"127.0.0.1", "::1", "::ffff:127.0.0.1"}:
+            self._send_json(403, {"error": "forbidden client"})
+            return False
+        hosts = self.headers.get_all("Host", [])
+        host = hosts[0] if len(hosts) == 1 else ""
+        try:
+            authority = urllib.parse.urlsplit("http://" + host)
+            valid = (authority.hostname in {"127.0.0.1", "localhost", "::1"}
+                     and not authority.username and not authority.password
+                     and not authority.path and not authority.query and not authority.fragment
+                     and (authority.port or 80) == self.server.server_port)
+        except ValueError:
+            valid = False
+        if not valid:
+            self._send_json(403, {"error": "forbidden host"})
+            return False
+        origin = self.headers.get("Origin")
+        if origin:
+            try:
+                source = urllib.parse.urlsplit(origin)
+                valid = (source.scheme == "http" and source.hostname == authority.hostname
+                         and (source.port or 80) == self.server.server_port
+                         and not source.username and not source.password and not source.path
+                         and not source.query and not source.fragment)
+            except ValueError:
+                valid = False
+            if not valid:
+                self._send_json(403, {"error": "forbidden origin"})
+                return False
+        site = self.headers.get("Sec-Fetch-Site")
+        if site and site not in {"same-origin", "none"}:
+            self._send_json(403, {"error": "forbidden fetch site"})
+            return False
+        if is_post and self.headers.get("X-Region-Guard") != "1":
+            self._send_json(403, {"error": "missing X-Region-Guard"})
+            return False
+        return True
+
+    def end_headers(self):
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        super().end_headers()
 
     def _send_json(self, code: int, payload: Any) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -5017,20 +3049,26 @@ class RegionGuardHandler(http.server.BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
         except Exception:
             length = 0
-        if length <= 0 or length > 65536:
+        if length == 0:
             return {}
+        if length < 0 or length > 65536:
+            raise ValueError("invalid body length")
         try:
             raw = self.rfile.read(length)
             data = json.loads(raw.decode("utf-8", errors="replace"))
-            return data if isinstance(data, dict) else {}
-        except Exception:
-            return {}
+            if not isinstance(data, dict):
+                raise ValueError("JSON object required")
+            return data
+        except (ValueError, UnicodeError):
+            raise ValueError("invalid JSON body")
 
     def do_GET(self) -> None:
+        if not self._check_request_security():
+            return
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         qs = urllib.parse.parse_qs(parsed.query)
-        target = (qs.get("target") or ["SG"])[0]
+        target = (qs.get("target") or [get_prefs()["target"]])[0]
 
         if path == "/":
             self._send_static("index.html")
@@ -5041,6 +3079,9 @@ class RegionGuardHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(
                 200,
                 {
+                    "service": "RegionGuard",
+                    "native_ready": NATIVE_READY,
+                    "native_connections_available": native_backend_available(),
                     "accept_language": self.headers.get("Accept-Language", ""),
                     "user_agent": self.headers.get("User-Agent", ""),
                     "sec_ch_ua": self.headers.get("Sec-CH-UA", ""),
@@ -5061,52 +3102,112 @@ class RegionGuardHandler(http.server.BaseHTTPRequestHandler):
                 report = run_full_scan(target)
                 self._send_json(200, report)
             except Exception as exc:
-                self._send_json(500, {"error": str(exc)})
+                self._send_json(500, {"error": "检测未能完成，请重试"})
         elif path == "/api/pulse":
             try:
                 res = run_pulse(target)
                 self._send_json(200, res)
             except Exception as exc:
-                self._send_json(500, {"error": str(exc)})
+                self._send_json(500, {"error": "检测未能完成，请重试"})
         elif path == "/api/history":
             with HISTORY_LOCK:
                 items = list(PULSE_HISTORY)
                 baseline = BASELINE_IP
             self._send_json(200, {"items": items, "baseline_ip": baseline})
+        elif path == "/api/prefs":
+            self._send_json(200, get_prefs())
         elif path == "/api/monitor/status":
             self._send_json(200, MONITOR.status())
+        elif path == "/api/telemetry/status":
+            TELEMETRY_SERVICE.refresh_trust()
+            self._send_json(200, TELEMETRY_SERVICE.status())
+        elif path == '/api/client-version/status':
+            self._send_json(200, CLIENT_VERSION.status())
+        elif path == '/api/traffic/status':
+            self._send_json(200, CLAUDE_TRAFFIC.status())
         else:
             self.send_error(404, "Not found")
 
     def do_POST(self) -> None:
         global BASELINE_IP
+        if not self._check_request_security(is_post=True):
+            return
         parsed = urllib.parse.urlparse(self.path)
         qs = urllib.parse.parse_qs(parsed.query)
 
-        if parsed.path == "/api/history/clear":
-            with HISTORY_LOCK:
-                PULSE_HISTORY.clear()
-                BASELINE_IP = None
-                _clear_pulse_log()
-            self._send_json(200, {"ok": True})
-        elif parsed.path == "/api/monitor/start":
-            body = self._read_json_body()
-            target = str((qs.get("target") or [body.get("target") or "SG"])[0])
-            raw_int = (qs.get("interval") or [body.get("interval") or 30])[0]
-            try:
-                interval_sec = int(raw_int)
-            except Exception:
-                interval_sec = 30
-            self._send_json(200, MONITOR.start(target_code=target, interval_sec=interval_sec))
-        elif parsed.path == "/api/monitor/stop":
-            self._send_json(200, MONITOR.stop())
-        else:
-            self.send_error(404, "Not found")
+        try:
+            if parsed.path in {"/api/telemetry/start", "/api/telemetry/stop",
+                               "/api/telemetry/trust", "/api/telemetry/launch"}:
+                actions = {"start": TELEMETRY_SERVICE.start, "stop": TELEMETRY_SERVICE.stop,
+                           "trust": TELEMETRY_SERVICE.trust_certificate,
+                           "launch": TELEMETRY_SERVICE.launch_claude}
+                try:
+                    self._send_json(200, actions[parsed.path.rsplit('/', 1)[1]]())
+                except RuntimeError as exc:
+                    self._send_json(409, {"error": str(exc)})
+            elif parsed.path == '/api/client-version/review':
+                body = self._read_json_body()
+                try:
+                    self._send_json(200, CLIENT_VERSION.mark_reviewed(body.get('expected_versions')))
+                except RuntimeError as exc:
+                    self._send_json(409, {'error': str(exc)})
+            elif parsed.path == "/api/history/clear":
+                with HISTORY_LOCK:
+                    PULSE_HISTORY.clear()
+                    BASELINE_IP = None
+                    _clear_pulse_log()
+                MONITOR._emit()
+                self._send_json(200, {"ok": True})
+            elif parsed.path == "/api/prefs":
+                self._send_json(200, update_prefs(self._read_json_body()))
+            elif parsed.path == "/api/monitor/start":
+                body = self._read_json_body()
+                prefs = get_prefs()
+                target = str((qs.get("target") or [body.get("target", prefs["target"])])[0])
+                raw_interval = (qs.get("interval") or [body.get("interval", prefs["interval_sec"])])[0]
+                interval = int(raw_interval)
+                # Persist the same preferences whether the control comes from the browser or tray.
+                update_prefs({"target": target, "interval_sec": interval, "auto_start_monitor": True})
+                self._send_json(200, MONITOR.start(target, interval))
+            elif parsed.path == "/api/monitor/stop":
+                self._send_json(200, MONITOR.stop())
+            else:
+                self.send_error(404, "Not found")
+        except (ValueError, TypeError):
+            self._send_json(400, {"error": "invalid preferences or request body"})
+        except RuntimeError:
+            self._send_json(503, {"error": "守护未能启动，请稍后重试"})
+        except OSError:
+            self._send_json(500, {"error": "无法保存 RegionGuard 偏好"})
 
 
 class ThreadingHTTPServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+
+
+def create_http_server(host="127.0.0.1", preferred_port=8765):
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        raise ValueError("server must bind to loopback")
+    if type(preferred_port) is not int or not 0 <= preferred_port <= 65535:
+        raise ValueError("invalid port")
+    server_class = ThreadingHTTPServer
+    if host == "::1":
+        class IPv6HTTPServer(ThreadingHTTPServer):
+            address_family = socket.AF_INET6
+        server_class = IPv6HTTPServer
+    candidates = [preferred_port]
+    if preferred_port:
+        candidates.extend(p for p in range(max(8766, preferred_port + 1), 8800) if p != preferred_port)
+        candidates.append(0)
+    for port in candidates:
+        try:
+            httpd = server_class((host, port), RegionGuardHandler)
+            return httpd, httpd.server_port
+        except OSError as exc:
+            if exc.errno not in {errno.EADDRINUSE, errno.EACCES}:
+                raise
+    raise OSError("no available loopback port")
 
 
 def main() -> None:
@@ -5120,8 +3221,10 @@ def main() -> None:
     if args.host not in {"127.0.0.1", "localhost", "::1"}:
         raise SystemExit("Security guard: server only binds to loopback (127.0.0.1)")
 
-    srv = ThreadingHTTPServer((args.host, args.port), RegionGuardHandler)
-    url = f"http://{args.host}:{args.port}"
+    SHUTDOWN_EVENT.clear()
+    srv, actual_port = create_http_server(args.host, args.port)
+    url_host = "[::1]" if args.host == "::1" else args.host
+    url = f"http://{url_host}:{actual_port}"
     print(f"Region Guard ({PLATFORM_LABEL}) running at {url}", flush=True)
     should_open = args.open or (getattr(sys, "frozen", False) and not args.no_open)
     if should_open:
@@ -5137,6 +3240,10 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        if MONITOR.protection is not None:
+            MONITOR.protection.stop()
+        shutdown_observers()
+        MONITOR.stop()
         srv.server_close()
 
 

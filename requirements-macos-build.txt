@@ -1,0 +1,7 @@
+# Python 3.9 needs the last compatible binary wheels (12.0 has incorrect Python metadata).
+pyobjc-core==10.3.2; python_version < '3.10'
+pyobjc-framework-Cocoa==10.3.2; python_version < '3.10'
+pyobjc-framework-Cocoa>=11,<13; python_version >= '3.10'
+pyinstaller>=6.16,<7
+# HTTPS decryption dependencies are retired. Archived certificate fixtures skip
+# when cryptography is absent; they are not needed by the product or packaging.

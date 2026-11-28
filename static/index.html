@@ -15,9 +15,10 @@
         <div>
           <div class="monitor-head-title">
             <h1>Region Guard · 地区与防风控全景监测台</h1>
+            <span id="runModeBadge" class="badge info" role="status">运行模式识别中...</span>
             <span id="platformBadge" class="badge info">平台识别中...</span>
           </div>
-          <p id="appSubtitle" class="subtitle">本机直采 11 大 GeoIP / WHOIS / 全域名分流 / Fake-IP / UDP STUN / 系统指纹 / 浏览器 WebRTC &amp; 语音字体实测（纯只读 · 零密码/Cookie 明文）</p>
+          <p id="appSubtitle" class="subtitle">本机直采 11 大 GeoIP / WHOIS / 全域名分流 / Fake-IP / UDP STUN / 系统指纹 / 浏览器 WebRTC &amp; 语音字体实测（只读体检 · 可选 Claude 进程保护 · 零敏感值输出）</p>
         </div>
       </div>
       <div class="controls">
@@ -40,7 +41,7 @@
     </header>
 
     <!-- Alert Banner (hidden by default) -->
-    <div id="alertBanner" class="alert-banner hidden"></div>
+    <div id="alertBanner" class="alert-banner hidden" role="alert"></div>
 
     <!-- Top Summary Cards -->
     <section class="summary-grid">
@@ -93,7 +94,7 @@
       <div class="section-head compact">
         <div>
           <div class="monitor-head-title">
-            <h2>综合评分与扣分明细（纯只读检测 · 不修改系统/不清理文件）</h2>
+            <h2>只读体检评分与扣分明细（进程保护使用独立开关）</h2>
             <span id="gradeBadge" class="badge info">评级 --</span>
           </div>
           <p id="scoreFormulaText" class="section-sub">评分规则：满分 100 分，致命红线 -30/项 · 高危 FAIL -15/项 · 高风险 WARN -6/项 · 轻度 WARN -2/项（最低 0 分）</p>
@@ -126,18 +127,42 @@
             <h2>后台防断流守护监控 (Pulse Daemon)</h2>
             <span id="monitorStateBadge" class="badge err">未开启</span>
           </div>
-          <p class="section-sub">由后端 Python 独立线程持续运行并写入本地日志，关闭网页也会继续探活，可抓休眠唤醒瞬断与 IP 跳变</p>
+          <p class="section-sub">本地接口、路由及受检文件默认以 100ms 周期兜底，事件变化可提前复核；公网出口仍按下方秒级间隔检查。关闭网页仍运行，无法保证零泄漏。</p>
         </div>
         <div class="monitor-actions">
-          <select id="pulseInterval">
-            <option value="15">每 15 秒</option>
-            <option value="30" selected>每 30 秒</option>
-            <option value="60">每 60 秒</option>
+          <select id="pulseInterval" aria-label="公网出口复核频率">
+            <option value="15">公网每 15 秒</option>
+            <option value="30" selected>公网每 30 秒</option>
+            <option value="60">公网每 60 秒</option>
           </select>
           <button id="monitorToggleBtn" class="btn btn-accent">开启后台持续监控</button>
+          <label class="notify-toggle"><input type="checkbox" id="notifyEnabled" checked /> 系统弹窗通知</label>
+          <span id="prefsStatus" class="prefs-status" role="status" aria-live="polite"></span>
           <button id="clearHistoryBtn" class="btn btn-ghost">清空记录</button>
         </div>
       </div>
+
+      <div class="protection-controls">
+        <label class="notify-toggle"><input type="checkbox" id="protectionEnabled" checked /> 异常时自动强制退出 Claude</label>
+        <label class="select-wrap" for="localGuardInterval"><span>本地检测</span>
+          <select id="localGuardInterval"><option value="50">50 毫秒</option><option value="100" selected>100 毫秒</option><option value="250">250 毫秒</option><option value="500">500 毫秒</option></select>
+        </label>
+        <span id="protectionStatus" class="badge info" role="status" aria-live="polite">进程保护状态读取中</span>
+        <span id="localTelemetryStatus" class="badge info" role="status" aria-live="polite">本地文件：读取中</span>
+        <p class="section-sub">文件保护仅在观察到明确中国大陆字段时退出 Claude Desktop 及其 Helper；缺少文化/地区字段、核验中、格式未知或结果陈旧只提示待观察。网络守护独立保留严格策略。强退可能丢失未保存内容，不会自动重开；暂停监控或关闭此开关后不再终止进程。</p>
+        <p id="localTelemetryDetails" class="section-sub"></p>
+        <p class="section-sub">八组来源分别进行地区字段、仅元数据或日志码观察。仅元数据来源不核验地区；不读取 Cookie 值、安装标识值、MCP 配置正文或名称、离线队列正文。100ms 是检查周期，不能保证早于首次写入或上传。</p>
+        <p id="protectionAction" class="section-sub" role="status" aria-live="polite"></p>
+      </div>
+
+      <p id="fileSourcesHeading" class="section-sub">文件守护范围（固定八组；字段正常只代表受检字段未发现指定风险）</p>
+      <div class="table-scroll" role="region" aria-labelledby="fileSourcesHeading" tabindex="0">
+        <table class="data-table" aria-labelledby="fileSourcesHeading">
+          <thead><tr><th scope="col">观察来源</th><th scope="col">检查范围</th><th scope="col">本次观察状态</th><th scope="col">变化与数量</th><th scope="col">受检摘要</th></tr></thead>
+          <tbody id="fileSourcesBody"><tr><td colspan="5" class="empty-cell">读取八组来源状态中；尚未验证覆盖。</td></tr></tbody>
+        </table>
+      </div>
+      <p class="section-sub">有界观察表示存在文件数、字节或截断上限。日志码是本观察周期实际检查部分的累计，仅作提示；普通错误或正常文件变化不会单独触发强退。Cookie 写入、新设备标识、英文名称、零错误或记录数量均不证明地区安全。</p>
 
       <div class="pulse-kpis">
         <div class="kpi"><span>监控次数</span><strong id="kpiTotal">0</strong></div>
@@ -166,6 +191,34 @@
           </tbody>
         </table>
       </div>
+    </section>
+
+    <section class="card telemetry-card" aria-labelledby="telemetryHeading">
+      <div class="section-head compact">
+        <div>
+          <h2 id="telemetryHeading">只读流量与服务诊断</h2>
+          <p class="section-sub">后台连接观察随后台监控独立运行，不依赖网页或全面扫描；服务响应分类和版本提醒保留只读证据。HTTPS 正文解密继续退役，不检查上传正文。</p>
+        </div>
+        <span id="telemetryStatus" class="badge info" role="status" aria-live="polite">读取中</span>
+      </div>
+      <h3 id="trafficObservationHeading">后台连接观察</h3>
+      <p><span id="trafficObservationStatus" class="badge info" role="status" aria-live="polite">后台连接观察：读取中</span></p>
+      <p id="trafficObservationDetails" class="section-sub">等待读取当前样本；没有当前证据不等于没有连接。</p>
+      <div class="table-scroll" role="region" aria-labelledby="trafficObservationHeading" tabindex="0">
+        <table class="data-table" aria-labelledby="trafficObservationHeading">
+          <thead><tr><th scope="col">观察组</th><th scope="col">当前 socket</th><th scope="col">当前关联</th><th scope="col">最近样本增量</th><th scope="col">累计（仅历史）</th><th scope="col">入站证据</th><th scope="col">控制器路由选择</th><th scope="col">内核目的路由</th></tr></thead>
+          <tbody id="trafficObservationBody"><tr><td colspan="8" class="empty-cell">当前连接证据读取中，尚未确认。</td></tr></tbody>
+        </table>
+      </div>
+      <p class="section-sub">Helper 组包含已验证的 Claude 内置崩溃报告器；其他浏览器进程不在此组。</p>
+      <p id="trafficRouteHint" class="section-sub" role="status" aria-live="polite">DIRECT 仅是控制器路由选择，不等同物理直连或中国出口。</p>
+      <p id="trafficActionStatus" class="section-sub text-warn" role="status" aria-live="polite"></p>
+      <p id="trafficHistoryNote" class="section-sub">累计仅作历史参考；短连接或读取间隙仍可能未被观察，不代表全部流量已覆盖。</p>
+      <p class="section-sub">不安装或移除已有证书，不配置代理。仅观察到连接或启用 TUN / Global，均不能证明所有客户端流量已覆盖或必无直连。服务地区拒绝、权限拒绝、IP 限制、边缘验证、封禁、超时和原因未明的 403 分开记录。</p>
+      <p id="telemetryHistoryCounts" class="section-sub">旧版历史统计读取中；不作为当前正文检查或全流量覆盖证据。</p>
+      <p id="telemetryMessage" class="section-sub" role="status" aria-live="polite"></p>
+      <p id="clientVersionStatus" class="section-sub" role="status" aria-live="polite">客户端版本缓存读取中；仅作轻提醒。</p>
+      <button id="clientVersionReview" class="btn btn-secondary hidden" aria-describedby="clientVersionStatus" hidden>已复核版本变化</button>
     </section>
 
     <!-- Two-Column Matrix: Multi-DB GeoIP & Multi-Domain Routing -->
@@ -230,7 +283,7 @@
       <div class="section-head compact">
         <div>
           <h2>Claude 本机生成文件与设备关联残留全景清单</h2>
-          <p id="inventorySubtitle" class="section-sub">覆盖 Desktop 指纹文件（含 Windows MSIX 容器与 ant-did / Cookies / device_id_salt / config / 日志）、Claude Code CLI、系统凭据/钥匙串、边缘缓存/IDE 与全浏览器站点存储（纯只读脱敏）</p>
+          <p id="inventorySubtitle" class="section-sub">覆盖 Desktop 指纹文件（含 Windows MSIX 容器与 ant-did / Cookies / device_id_salt / config / 日志）、Claude Code CLI 路径存在性、系统关联路径与全浏览器站点元数据（纯只读脱敏）</p>
         </div>
         <span id="inventoryBadge" class="badge info">等待扫描...</span>
       </div>
@@ -288,9 +341,15 @@
         <label class="checklist-item"><input type="checkbox" data-check="reboot_abc" /><span id="chkRebootText">系统级修改（地区 / 计算机名 / 时区 / 休眠 / 定位）完成后已完整重启系统，并切到英文键盘再登录</span></label>
       </div>
     </section>
+    <section id="autostart-guide" class="card" aria-labelledby="autostart-title">
+      <h2 id="autostart-title">登录启动设置</h2>
+      <p class="section-sub">菜单栏仅检查自启状态。需要登录时启动，可自行在「系统设置 → 通用 → 登录项与扩展」中添加 RegionGuard.app。程序不会写入或移除 LaunchAgent，也不会更改系统设置。</p>
+    </section>
   </div>
 
   <div id="toast" class="toast hidden">已复制到剪贴板</div>
+  <script src="/static/fingerprint-checks.js"></script>
+  <script src="/static/locale-checks.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

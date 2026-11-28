@@ -908,3 +908,19 @@ select:focus {
     grid-template-columns: 1fr;
   }
 }
+
+/* Shared preference controls use the existing palette and native keyboard behavior. */
+.notify-toggle { display: inline-flex; align-items: center; gap: .5rem; min-height: 2.75rem; cursor: pointer; }
+.notify-toggle input { width: 1.125rem; height: 1.125rem; accent-color: var(--accent, #16a085); }
+.prefs-status { font-size: .8125rem; color: var(--text-muted, #65758b); }
+.notify-toggle:focus-within { outline: 2px solid var(--accent, #16a085); outline-offset: 3px; }
+.alert-banner { white-space: pre-line; }
+
+.protection-controls { display: flex; flex-wrap: wrap; gap: .75rem; align-items: center; padding: 1rem 0; border-top: 1px solid var(--border, #dce2eb); }
+.protection-controls p { flex-basis: 100%; margin: 0; }
+/* Software-owned telemetry controls follow the existing monitor spacing. */
+.telemetry-card { margin-top: 1rem; margin-bottom: 1rem; }
+.telemetry-actions { display: flex; flex-wrap: wrap; gap: .75rem; margin-bottom: 1rem; }
+.telemetry-trust { margin: 1rem 0; }
+.telemetry-trust summary { cursor: pointer; padding: .5rem 0; }
+.telemetry-trust .mono { overflow-wrap: anywhere; }

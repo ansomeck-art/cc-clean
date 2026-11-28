@@ -5,3 +5,18 @@ dist/
 pulse-events.jsonl
 .DS_Store
 Thumbs.db
+
+.venv-macos/
+.venv-filter/
+.macos-dmg-stage/
+
+# Keep local runtime state and credentials out of source uploads.
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+runtime.json
+prefs.json
+protection-events.jsonl

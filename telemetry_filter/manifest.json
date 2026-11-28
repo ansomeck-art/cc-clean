@@ -1,0 +1,16 @@
+{
+  "version": "2.0.0",
+  "owner": "RegionGuard",
+  "transport": "software_loopback_proxy",
+  "sha256": "bdecd42e6a02313b2cd8f218c56952be871762318b092989f87afb8f6c22caf4",
+  "max_body_bytes": 1048576,
+  "max_decoded_bytes": 2097152,
+  "hosts": [
+    "claude.ai",
+    "api.anthropic.com",
+    "a-api.anthropic.com",
+    "o1158394.ingest.us.sentry.io",
+    "browser-intake-us5-datadoghq.com",
+    "http-intake.logs.us5.datadoghq.com"
+  ]
+}

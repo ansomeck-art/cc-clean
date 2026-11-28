@@ -2,6 +2,16 @@
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ "${1:-}" = "--tray" ]; then
+  shift
+  if [ -x "${DIR}/.venv-filter/bin/python" ]; then
+    exec "${DIR}/.venv-filter/bin/python" "${DIR}/tray_app.py" "$@"
+  fi
+  if [ -x "${DIR}/.venv-macos/bin/python" ]; then
+    exec "${DIR}/.venv-macos/bin/python" "${DIR}/tray_app.py" "$@"
+  fi
+  exec python3 "${DIR}/tray_app.py" "$@"
+fi
 PORT="${1:-8765}"
 
 if command -v python3 >/dev/null 2>&1; then
